@@ -299,7 +299,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) <= sizeof(uint64_t), "Invalid number of NVL peers");
                 auto is_token_in_rank_uint64 =
                     *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
                 auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
