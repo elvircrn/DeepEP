@@ -152,6 +152,7 @@ struct LowLatencyLayout {
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
         size_t combine_send_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
         size_t send_buffer_bytes = std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
+        send_buffer_bytes = align_up<size_t>(send_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
         EP_HOST_ASSERT(send_buffer_bytes % sizeof(int4) == 0);
         total_bytes += send_buffer_bytes * 2;
 
@@ -160,6 +161,7 @@ struct LowLatencyLayout {
         size_t dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
         size_t combine_recv_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
         size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
+        recv_buffer_bytes = align_up<size_t>(recv_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
         EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
         total_bytes += recv_buffer_bytes * 2;
 

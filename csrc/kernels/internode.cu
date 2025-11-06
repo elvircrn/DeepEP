@@ -299,14 +299,14 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) <= sizeof(uint64_t), "Invalid number of NVL peers");
-                auto is_token_in_rank_uint64 =
-                    *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
-                auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
+                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint32_t), "Invalid number of NVL peers");
+                auto is_token_in_rank_uint32 =
+                    *reinterpret_cast<const uint32_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
+                auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint32);
                 #pragma unroll
                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++j)
                     per_nvl_rank_count[j] += is_token_in_rank_values[j];
-                total_count += (is_token_in_rank_uint64 != 0);
+                total_count += (is_token_in_rank_uint32 != 0);
             }
 
             // Warp reduce
@@ -514,7 +514,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     // RDMA symmetric layout
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) <= sizeof(uint64_t), "Invalid number of NVL peers");
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint32_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
     auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
@@ -626,22 +626,22 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
             // Read RDMA rank existence
-            uint64_t is_token_in_rank_uint64 = 0;
+            uint32_t is_token_in_rank_uint32 = 0;
             if (lane_id < kNumRDMARanks) {
-                is_token_in_rank_uint64 =
-                    __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
-                global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
+                is_token_in_rank_uint32 =
+                    __ldg(reinterpret_cast<const uint32_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                global_rdma_tail_idx += (is_token_in_rank_uint32 != 0);
             }
             __syncwarp();
 
             // Skip the token which does not belong to this warp
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
-            auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
+            auto rdma_tail_idx = is_token_in_rank_uint32 == 0 ? -1 : global_rdma_tail_idx - 1;
 
             // Wait the remote buffer to be released
             auto start_time = clock64();
-            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
+            while (is_token_in_rank_uint32 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
 
                 // Timeout check
@@ -671,8 +671,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
                     slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
                     topk_ranks[num_topk_ranks] = i;
-                    auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
-                    auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
+                    auto recv_is_token_in_rank_uint32 = broadcast(is_token_in_rank_uint32, i);
+                    auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint32);
                     if (lane_id == num_topk_ranks)
                         src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
                     dst_send_buffers[num_topk_ranks++] =
@@ -723,7 +723,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             __syncwarp();
 
             // Release the transaction in the window
-            if (is_token_in_rank_uint64 != 0) {
+            if (is_token_in_rank_uint32 != 0) {
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
                 auto latest_tail = rdma_send_channel_tail[lane_id];
