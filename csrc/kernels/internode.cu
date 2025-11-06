@@ -17,7 +17,7 @@ extern nvshmem_team_t cpu_rdma_team;
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 4 || NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
 
     __forceinline__ SourceMeta() = default;
 
@@ -514,7 +514,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     // RDMA symmetric layout
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) <= sizeof(uint64_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
     auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
