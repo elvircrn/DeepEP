@@ -61,6 +61,7 @@ class Buffer:
         # Initialize the CPP runtime
         if group is not None:
             self.rank = group.rank()
+            self.group = group
             self.group_size = group.size()
 
             def all_gather_object(obj):
@@ -69,6 +70,7 @@ class Buffer:
                 return object_list
         elif comm is not None:
             self.rank = comm.Get_rank()
+            self.group = group
             self.group_size = comm.Get_size()
 
             def all_gather_object(obj):
