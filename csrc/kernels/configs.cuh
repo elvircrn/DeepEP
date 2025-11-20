@@ -3,7 +3,7 @@
 #define NVLINK_DOMAIN_LARGE
 
 #ifdef NVLINK_DOMAIN_LARGE
-#define NUM_MAX_NVL_PEERS 24
+#define NUM_MAX_NVL_PEERS 32
 #else
 #define NUM_MAX_NVL_PEERS 8
 #endif
