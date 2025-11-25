@@ -148,7 +148,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
-                printf("========== Issuing ibgda sends dst_expert_idx = %d ==========\n", dst_expert_idx);
+                // printf("========== Issuing ibgda sends dst_expert_idx = %d ==========\n", dst_expert_idx);
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
@@ -160,10 +160,10 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      slot_idx * num_bytes_per_msg;
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (dst_p2p_ptr == 0) {
-                    printf("========== Issuing ibgda dst_p2p_ptr == 0 sends dst_expert_idx = %d ==========\n", dst_expert_idx);
+                    // printf("========== Issuing ibgda dst_p2p_ptr == 0 sends dst_expert_idx = %d ==========\n", dst_expert_idx);
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                 } else {
-                    printf("========== Issuing ibgda dst_p2p_ptr != 0 sends dst_expert_idx = %d ==========\n", dst_expert_idx);
+                    // printf("========== Issuing ibgda dst_p2p_ptr != 0 sends dst_expert_idx = %d ==========\n", dst_expert_idx);
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
