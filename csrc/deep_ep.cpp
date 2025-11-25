@@ -291,7 +291,7 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
-void Buffer::x§(const std::vector<int> &device_ids,
+void Buffer::sync(const std::vector<int> &device_ids,
                   const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
