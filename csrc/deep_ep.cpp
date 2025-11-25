@@ -205,13 +205,14 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+
+	fprintf(stderr, "========== nvl: %d rdma: %d ==========\n", (int) num_nvl_bytes, (int) num_rdma_bytes);
 }
 
 Buffer::~Buffer() noexcept(false) {
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
-	fprintf(stderr, "========== nvl: %d rdma: %d ==========\n", (int) num_nvl_bytes, (int) num_rdma_bytes);
 
     if (num_nvl_bytes > 0) {
         // Barrier
