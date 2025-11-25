@@ -51,9 +51,11 @@ bool support_fabric() {
         int support = 0;
         CU_CHECK(cuDeviceGetAttribute(&support, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
         if (!support) {
+			printf("====================================fabric not supported=============================================");
             return false;
         }
     }
+	printf("====================================fabric supported=============================================");
 
     return true;
 }
