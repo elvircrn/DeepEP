@@ -206,7 +206,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         *moe_recv_rdma_counter = -1;
     }
 
-	fprintf(stderr, "========== nvl: %lld rdma: %lld ==========\n", num_nvl_bytes, num_rdma_bytes);
+	fprintf(stderr, "Buffer::Buffer() ========== nvl: %lld rdma: %lld ==========\n", num_nvl_bytes, num_rdma_bytes);
 }
 
 Buffer::~Buffer() noexcept(false) {
