@@ -434,19 +434,19 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, cons
 __device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank) {
     // Local rank, no need for mapping
     if (rank == dst_rank) {
-        printf("========== rank == dst_rank ==========\n", dst_expert_idx);
+        printf("========== rank == dst_rank ==========\n");
         return ptr;
     }
     auto peer_base = __ldg(reinterpret_cast<uint64_t*>(nvshmemi_device_state_d.peer_heap_base_p2p) + dst_rank);
 
     // RDMA connected
     if (peer_base == 0) {
-        printf("========== peer_base == 0 ==========\n", dst_expert_idx);
+        printf("========== peer_base == 0 ==========\n");
         return 0;
     }
 
     // NVLink P2P is enabled
-    printf("========== NVLink P2P is enabled ==========\n", dst_expert_idx);
+    printf("========== NVLink P2P is enabled ==========\n");
     return peer_base + (ptr - reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base));
 }
 
