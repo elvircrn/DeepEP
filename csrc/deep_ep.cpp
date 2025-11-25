@@ -344,6 +344,9 @@ void Buffer::sync(const std::vector<int> &device_ids,
     }
 #endif
 
+	fprintf(stderr, "==================================== nvl: %d rdma: %d =============================================\n", num_nvl_bytes, num_rdma_bytes);
+
+
     // Ready to use
     available = true;
 }
