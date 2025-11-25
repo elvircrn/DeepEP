@@ -211,6 +211,8 @@ Buffer::~Buffer() noexcept(false) {
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
+	fprintf(stderr, "========== nvl: %d rdma: %d ==========\n", (int) num_nvl_bytes, (int) num_rdma_bytes);
+
     if (num_nvl_bytes > 0) {
         // Barrier
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
@@ -344,7 +346,6 @@ void Buffer::sync(const std::vector<int> &device_ids,
     }
 #endif
 
-	fprintf(stderr, "========== nvl: %d rdma: %d ==========\n", (int) num_nvl_bytes, (int) num_rdma_bytes);
 
 
     // Ready to use
@@ -764,6 +765,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
     pybind11::gil_scoped_release release;
+
+
 
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
