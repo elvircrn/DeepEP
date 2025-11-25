@@ -160,6 +160,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      slot_idx * num_bytes_per_msg;
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (dst_p2p_ptr == 0) {
+                    printf("========== Issuing ibgda dst_p2p_ptr == 0 sends dst_expert_idx = %d ==========\n", dst_expert_idx);
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                 } else {
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
