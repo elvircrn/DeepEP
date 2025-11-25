@@ -210,7 +210,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     }
 
     // Buffer::Buffer() ========== nvl: 1073741824 rdma: 3760195712 ==========
-	fprintf(stderr, "Buffer::Buffer() ========== nvl: %lld rdma: %lld ==========\n", num_nvl_bytes, num_rdma_bytes);
+	fprintf(stderr, "Buffer::Buffer() ========== nvl: %ld rdma: %ld ==========\n", num_nvl_bytes, num_rdma_bytes);
 }
 
 Buffer::~Buffer() noexcept(false) {
