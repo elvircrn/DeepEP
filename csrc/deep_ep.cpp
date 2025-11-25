@@ -116,6 +116,7 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
     printf("============= open_mem_handle: enable_fabric = %d =============\n", int(enable_fabric));
 
+    // ============= open_mem_handle: enable_fabric = 1 =============
     if (enable_fabric) {
         size_t size = mem_handle->size;
 
@@ -208,6 +209,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         *moe_recv_rdma_counter = -1;
     }
 
+    // Buffer::Buffer() ========== nvl: 1073741824 rdma: 3760195712 ==========
 	fprintf(stderr, "Buffer::Buffer() ========== nvl: %lld rdma: %lld ==========\n", num_nvl_bytes, num_rdma_bytes);
 }
 
