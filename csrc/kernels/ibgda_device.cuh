@@ -441,7 +441,7 @@ __device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, co
 
     // RDMA connected
     if (peer_base == 0) {
-        printf("========== peer_base == 0 ==========\n");
+        // printf("========== peer_base == 0 ==========\n");
         return 0;
     }
 

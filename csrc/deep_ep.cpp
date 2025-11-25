@@ -51,11 +51,11 @@ bool support_fabric() {
         int support = 0;
         CU_CHECK(cuDeviceGetAttribute(&support, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
         if (!support) {
-			fprintf(stderr, "====================================fabric not supported=============================================\n");
+			// fprintf(stderr, "====================================fabric not supported=============================================\n");
             return false;
         }
     }
-	printf("====================================fabric supported=============================================\n");
+	// printf("====================================fabric supported=============================================\n");
 
     return true;
 }
@@ -114,7 +114,7 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
 }
 
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
-    printf("============= open_mem_handle: enable_fabric = %d =============\n", int(enable_fabric));
+    // printf("============= open_mem_handle: enable_fabric = %d =============\n", int(enable_fabric));
 
     // ============= open_mem_handle: enable_fabric = 1 =============
     if (enable_fabric) {
@@ -210,7 +210,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     }
 
     // Buffer::Buffer() ========== nvl: 1073741824 rdma: 3760195712 ==========
-	fprintf(stderr, "Buffer::Buffer() ========== nvl: %ld rdma: %ld ==========\n", num_nvl_bytes, num_rdma_bytes);
+	// fprintf(stderr, "Buffer::Buffer() ========== nvl: %ld rdma: %ld ==========\n", num_nvl_bytes, num_rdma_bytes);
 }
 
 Buffer::~Buffer() noexcept(false) {
