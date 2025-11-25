@@ -114,6 +114,8 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
 }
 
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
+    printf("============= enable_fabric = %d =============\n", int(enable_fabric));
+
     if (enable_fabric) {
         size_t size = mem_handle->size;
 
