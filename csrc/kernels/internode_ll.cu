@@ -525,7 +525,7 @@ combine(void* combined_x,
                 // Reduce
                 // auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
 
-                const int4 x_vec{};
+                int4 x_vec{};
                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
                 #pragma unroll
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
