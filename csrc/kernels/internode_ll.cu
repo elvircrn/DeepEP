@@ -461,8 +461,10 @@ combine(void* combined_x,
             const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             if (dst_p2p_ptr == 0) {
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+#if 0
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
+#endif
                 nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(nv_bfloat16), dst_rank, local_expert_idx, lane_id, token_idx - offset);
             } else {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
