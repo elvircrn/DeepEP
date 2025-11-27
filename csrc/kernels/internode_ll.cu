@@ -434,7 +434,6 @@ combine(void* combined_x,
 
     // Issue IBGDA sends
     if (responsible_expert_idx < num_experts) {
-        return;
         const auto dst_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
         const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
@@ -456,6 +455,7 @@ combine(void* combined_x,
             const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
 
             // Copy directly to local rank, or copy to buffer and issue RDMA
+            #if 0
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
@@ -469,6 +469,7 @@ combine(void* combined_x,
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             }
+            #endif
         }
 
         // Put the finishing flag
