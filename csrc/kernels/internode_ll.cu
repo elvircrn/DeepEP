@@ -455,7 +455,7 @@ combine(void* combined_x,
             const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
 
             // Copy directly to local rank, or copy to buffer and issue RDMA
-            #if 0
+            #ifndef ELVIR_DEBUG
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
@@ -520,14 +520,16 @@ combine(void* combined_x,
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
+#ifdef ELVIR_DEBUG
+                int4 x_vec{};
+#else
                 // Read from sources
-                // auto rdma_buffer_type = reinterpret_cast<const int*>(static_cast<uint8_t*>(rdma_recv_x) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
-                // auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
+                auto rdma_buffer_type = reinterpret_cast<const int*>(static_cast<uint8_t*>(rdma_recv_x) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
+                auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
 
                 // Reduce
-                // auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
-
-                int4 x_vec{};
+                auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
+#endif
                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
                 #pragma unroll
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
