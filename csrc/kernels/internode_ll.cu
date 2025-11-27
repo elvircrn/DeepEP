@@ -555,7 +555,7 @@ void combine(void* combined_x,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy) { return;
+             cudaStream_t stream, int phases, bool zero_copy) {
     constexpr int kNumMaxTopk = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
