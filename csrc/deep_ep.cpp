@@ -1300,7 +1300,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                             int num_max_dispatch_tokens_per_rank, int num_experts,
                             bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out) {
-    return {};
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
 

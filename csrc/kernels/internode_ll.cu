@@ -49,7 +49,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int num_warp_groups, int num_warps_per_group,
-         bool round_scale, int phases) {
+         bool round_scale, int phases) { return;
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -340,7 +340,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
-              cudaStream_t stream, int phases) {
+              cudaStream_t stream, int phases) { return;
     constexpr int kNumMaxTopK = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -397,7 +397,7 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy) { return;
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
