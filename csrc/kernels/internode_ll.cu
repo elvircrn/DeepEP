@@ -397,7 +397,7 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy) { return;
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
