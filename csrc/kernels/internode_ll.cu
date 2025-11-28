@@ -340,7 +340,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
               void* workspace, int num_device_sms,
-              cudaStream_t stream, int phases) { return;
+              cudaStream_t stream, int phases) {
     constexpr int kNumMaxTopK = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
