@@ -177,6 +177,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
          int scale_token_stride, int scale_hidden_stride,
          void** buffer_ptrs, int rank,
          int num_max_send_tokens, int num_recv_buffer_tokens) {
+    // NOTE(elvircrn):
+    return;
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;

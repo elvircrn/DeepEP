@@ -129,7 +129,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
                     if (lane_id == 0 or lane_id == 16)
                         rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
-
                     // Cast into send buffer
                     vec_t int2_value;
                     auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
