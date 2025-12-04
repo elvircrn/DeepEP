@@ -15,6 +15,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
                 int num_tokens, int num_channels, const bool* is_token_in_rank, int* channel_prefix_matrix,
                 int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
                 void** buffer_ptrs, int** barrier_signal_ptrs, int rank) {
+    // NOTE(elvircrn):
+    return;
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
