@@ -62,7 +62,7 @@ private:
 
     // NVLink Buffer
     int64_t num_nvl_bytes;
-    void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    void* buffer_ptrs[8] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
     // NVSHMEM Buffer
