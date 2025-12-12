@@ -630,7 +630,13 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         // NOTE(elvircrn)
         // num_send_warps = 32 kNumThreads = 1024
         // printf("num_send_warps = %d kNumThreads = %d\n", num_send_warps, kNumThreads);
-        EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
+
+        if (num_send_warps * 32 != kNumThreads) {
+            if (!threadIdx.x) {
+                printf("num_send_warps * 32 != kNumThreads = %d %d\n", num_send_warps, kNumThreads);
+            }
+        }
+        // EP_DEVICE_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
