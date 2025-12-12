@@ -628,8 +628,9 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const auto send_warp_id_in_rank = send_warp_id % num_send_warps_per_rank;
 
         // NOTE(elvircrn)
-        printf("num_send_warps = %d kNumThreads = %d\n", num_send_warps, kNumThreads);
-        // EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
+        // num_send_warps = 32 kNumThreads = 1024
+        // printf("num_send_warps = %d kNumThreads = %d\n", num_send_warps, kNumThreads);
+        EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
