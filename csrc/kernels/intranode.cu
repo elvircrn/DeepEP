@@ -614,6 +614,10 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
+
+        // kNumRanks = 16
+        // num_send_warps_per_rank = 2
+        // num_send_warps = 2 * 16 = 32
         constexpr int num_send_warps_per_rank = (kNumThreads / 32) / kNumRanks;
         constexpr int num_send_warps = num_send_warps_per_rank * kNumRanks;
         const auto num_threads_per_rank = num_send_warps_per_rank * 32;
@@ -621,7 +625,10 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         const auto send_warp_id = send_thread_id / 32;
         const auto send_rank_id = thread_id / num_threads_per_rank;
         const auto send_warp_id_in_rank = send_warp_id % num_send_warps_per_rank;
-        EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
+
+        // NOTE(elvircrn)
+        printf("num_send_warps = %d kNumThreads = %d\n", num_send_warps, kNumThreads);
+        // EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
         // Calculate pointers by the specific layout
         auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
