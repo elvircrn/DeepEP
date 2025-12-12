@@ -351,6 +351,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
         EP_DEVICE_ASSERT(kNumRanks <= 32);
+        printf("num_recv_warps, kNumRanks = %d %d\n", (int) num_recv_warps, (int) kNumRanks);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Calculate offset first

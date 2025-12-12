@@ -316,6 +316,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                   buffer_ptrs, barrier_signal_ptrs, rank, \
                   cpu_rdma_team); } break
 
+    // NOTE(elvircrn)
     constexpr int kNumThreads = 1024;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
