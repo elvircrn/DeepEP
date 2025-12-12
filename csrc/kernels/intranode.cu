@@ -486,7 +486,8 @@ void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* re
               cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
     // NOTE(elvircrn)
     constexpr int kNumThreads = 1024;
-    constexpr int kNumTMABytesPerWarp = 8192;
+    // NOTE(elvircrn)
+    constexpr int kNumTMABytesPerWarp = 4096;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
