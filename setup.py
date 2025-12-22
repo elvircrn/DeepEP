@@ -19,7 +19,7 @@ if __name__ == '__main__':
     include_dirs = ['csrc/']
     library_dirs = []
     nvcc_dlink = []
-    extra_link_args = ['-lcuda']
+    extra_link_args = ['-L/usr/local/cuda/lib64/stubs', '-lcuda']
 
     # NVSHMEM flags
     if disable_nvshmem:
