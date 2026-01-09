@@ -53,6 +53,7 @@ cfg.dynamicSmemBytes = smem_size;
         case 4: case_macro(4); \
         case 8: case_macro(8); \
         case 16: case_macro(16); \
+        case 32: case_macro(32); \
         default: EP_HOST_ASSERT(false and "Unsupported ranks"); \
     } while (false)
 
@@ -65,6 +66,7 @@ cfg.dynamicSmemBytes = smem_size;
         case 16: case_macro(16); \
         case 18: case_macro(18); \
         case 20: case_macro(20); \
+        case 32: case_macro(32); \
         default: EP_HOST_ASSERT(false and "Unsupported RDMA ranks"); \
     } while (false)
 
@@ -74,6 +76,7 @@ cfg.dynamicSmemBytes = smem_size;
         case 4: case_macro(dtype, 4); \
         case 8: case_macro(dtype, 8); \
         case 16: case_macro(dtype, 16); \
+        case 32: case_macro(dtype, 32); \
         default: EP_HOST_ASSERT(false && "Unsupported ranks"); \
     } while (false)
 
