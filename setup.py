@@ -48,7 +48,7 @@ if __name__ == '__main__':
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
         sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
-        include_dirs.extend([f'{nvshmem_dir}/include'])
+        include_dirs.extend([f'{nvshmem_dir}/include', '/usr/local/cuda-13/include/cccl'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
