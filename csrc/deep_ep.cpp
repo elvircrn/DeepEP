@@ -1366,16 +1366,20 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                             const torch::Tensor& src_info, const torch::Tensor& layout_range,
                             const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
                             int num_max_dispatch_tokens_per_rank, int num_experts,
                             bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out,
-                            bool overlap, const std::optional<torch::Tensor>& src_signals, uint32_t src_signal_expect_value) {
+                            bool overlap, const std::optional<torch::Tensor>& src_signals, uint32_t src_signal_expect_value,
+                            bool use_nvfp4, bool use_ue8m0_for_sf,
+                            const std::optional<torch::Tensor>& x_global_scale) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(not (use_logfmt and use_nvfp4));
+    EP_HOST_ASSERT(not (use_nvfp4 and out.has_value()));
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1418,19 +1422,99 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
-    // Allocate output tensor
+    // Allocate output tensor and optional NVFP4 scales
     torch::Tensor combined_x;
-    if (out.has_value()) {
-        EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
-        EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
-        EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
-        combined_x = out.value();
+    auto combined_x_scales = std::optional<torch::Tensor>();
+    void* combined_x_scales_ptr = nullptr;
+    const float* global_scale_ptr = nullptr;
+
+    if (use_nvfp4) {
+        combined_x = torch::empty({num_combined_tokens, hidden / 2},
+                                  torch::dtype(torch::kUInt8).device(torch::kCUDA));
+
+        // Allocate scales in swizzled layout (rm, rk, 32, 4, 4) — same as dispatch
+        constexpr int kNumPerChannels = 16;
+        constexpr int NUM_SF_ELEMS_PER_PACK = 4;
+        EP_HOST_ASSERT(hidden % kNumPerChannels == 0);
+        auto rm = (num_combined_tokens + 127) / 128;
+        auto rk = (hidden + (kNumPerChannels * NUM_SF_ELEMS_PER_PACK) - 1) / (kNumPerChannels * NUM_SF_ELEMS_PER_PACK);
+        if (use_ue8m0_for_sf) {
+            combined_x_scales = torch::empty({rm, rk, 32, 4, 4},
+                                              torch::dtype(torch::kInt).device(torch::kCUDA));
+        } else {
+            combined_x_scales = torch::empty({rm, rk, 32, 4, 4},
+                                              torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+        }
+        // After permute, the logical shape is (32, 4, rm, 4, rk)
+        combined_x_scales = combined_x_scales.value().permute({2, 3, 0, 4, 1});
+        combined_x_scales_ptr = combined_x_scales->data_ptr();
+
+        if (x_global_scale.has_value())
+            global_scale_ptr = x_global_scale->data_ptr<float>();
     } else {
-        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        if (out.has_value()) {
+            EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
+            EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
+            EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
+            combined_x = out.value();
+        } else {
+            combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        }
     }
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
+    if (use_nvfp4) {
+        auto launcher = [=](int phases) {
+            if (use_ue8m0_for_sf) {
+                internode_ll::combine_nvfp4<true>(
+                    combined_x.data_ptr(), combined_x_scales_ptr,
+                    global_scale_ptr,
+                    buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
+                    buffer.combine_rdma_send_buffer,
+                    x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
+                    src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+                    combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                    next_clean_meta.first, next_clean_meta.second,
+                    num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                    num_topk, num_experts, rank, num_ranks,
+                    workspace, num_device_sms,
+                    launch_stream, phases, zero_copy,
+                    overlap, src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr, src_signal_expect_value);
+            } else {
+                internode_ll::combine_nvfp4<false>(
+                    combined_x.data_ptr(), combined_x_scales_ptr,
+                    global_scale_ptr,
+                    buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
+                    buffer.combine_rdma_send_buffer,
+                    x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
+                    src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+                    combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                    next_clean_meta.first, next_clean_meta.second,
+                    num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                    num_topk, num_experts, rank, num_ranks,
+                    workspace, num_device_sms,
+                    launch_stream, phases, zero_copy,
+                    overlap, src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr, src_signal_expect_value);
+            }
+        };
+        launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+
+        std::optional<EventHandle> event;
+        if (async) {
+            event = EventHandle(launch_stream);
+        } else if (not return_recv_hook) {
+            stream_wait(compute_stream, launch_stream);
+        }
+
+        std::optional<std::function<void()>> recv_hook = std::nullopt;
+        if (return_recv_hook)
+            recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+
+        return {combined_x, combined_x_scales, event, recv_hook};
+    }
+
+    // Non-NVFP4 path (original)
     auto launcher = [=](int phases) {
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
@@ -1464,7 +1548,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {combined_x, event, recv_hook};
+    return {combined_x, std::nullopt, event, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};

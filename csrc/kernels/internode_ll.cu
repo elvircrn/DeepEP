@@ -770,7 +770,7 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
 }
 
 // TODO unify with original code
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseNVFP4 = false, bool kUseUE8M0ForNVFP4SF = false>
 __global__
 __launch_bounds__(1024, 1)
 // __maxnreg__(48) // rm
@@ -787,7 +787,9 @@ combine_v2(void* combined_x,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
         int phases, bool zero_copy,
-        uint32_t* src_signals, uint32_t src_signal_expect_value) {
+        uint32_t* src_signals, uint32_t src_signal_expect_value,
+        void* combined_x_scales, const float* global_scale_ptr) {
+    EP_STATIC_ASSERT(!(kUseLogFMT && kUseNVFP4), "LogFMT and NVFP4 are mutually exclusive");
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1168,25 +1170,95 @@ combine_v2(void* combined_x,
                         mbarrier_arrive(empty_barriers[stage_idx]);
                     stage_idx = (stage_idx + 1) % kNumStages;
                 }
-                tma_store_wait<0>();
+                if constexpr (!kUseNVFP4)
+                    tma_store_wait<0>();
 
-                #pragma unroll
-                for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
-                    auto combined_pack = __nv_bfloat162(combined_values[k * 2], combined_values[k * 2 + 1]);
-                    tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack);
-                }
-                tma_store_fence();
-                if (elect_one_sync(lane_id)) {
-                    tma_store_1d(tma_st_buffers[decode_warp_idx],
-                                 static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
-                                 kNumBF16PerWarpBytes);
+                if constexpr (kUseNVFP4) {
+                    // Thread-local amax over 16 combined_values
+                    float amax = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < kNumRecvUnrolls * 4 * 2; ++k)
+                        amax = fmaxf(amax, fabsf(combined_values[k]));
+
+                    // Compute scale factor
+                    uint8_t sf_val;
+                    float outputScale;
+                    if constexpr (kUseUE8M0ForNVFP4SF) {
+                        __nv_fp8_e8m0 tmp;
+                        amax *= reciprocal_approximate_ftz(6.0f);
+                        tmp.__x = __nv_cvt_float_to_e8m0(amax, __NV_SATFINITE, cudaRoundPosInf);
+                        sf_val = tmp.__x;
+                        outputScale = exp2f_rcp(sf_val);
+                    } else {
+                        float gs = *global_scale_ptr;
+                        auto SFValue = gs * (amax * reciprocal_approximate_ftz(6.0f));
+                        __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+                        sf_val = tmp.__x;
+                        SFValue = static_cast<float>(tmp);
+                        outputScale = SFValue != 0
+                                          ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(gs))
+                                          : 0.0f;
+                    }
+
+                    // Convert first 8 values to e2m1
+                    float2 fp2Vals_lo[4];
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        fp2Vals_lo[k].x = combined_values[k * 2 + 0] * outputScale;
+                        fp2Vals_lo[k].y = combined_values[k * 2 + 1] * outputScale;
+                    }
+                    uint32_t e2m1_lo = fp32_vec_to_e2m1(fp2Vals_lo);
+
+                    // Convert second 8 values to e2m1
+                    float2 fp2Vals_hi[4];
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        fp2Vals_hi[k].x = combined_values[8 + k * 2 + 0] * outputScale;
+                        fp2Vals_hi[k].y = combined_values[8 + k * 2 + 1] * outputScale;
+                    }
+                    uint32_t e2m1_hi = fp32_vec_to_e2m1(fp2Vals_hi);
+
+                    // Direct global store FP4 data (8 bytes per thread)
+                    auto out_ptr = static_cast<uint32_t*>(combined_x) + token_idx * (kHidden / 4) + (decode_warp_idx * 32 + lane_id) * 2;
+                    out_ptr[0] = e2m1_lo;
+                    out_ptr[1] = e2m1_hi;
+
+                    // Store scale factor in swizzled layout (rm, rk, 32, 4, 4)
+                    constexpr int kNumPerChannels = 16;
+                    constexpr int NUM_SF_ELEMS_PER_PACK = 4;
+                    const auto rk = align<int>(kHidden / kNumPerChannels, 4) / 4;
+                    const auto dim0_stride = rk * 128 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim1_stride = 128 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim2_stride = 4 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim3_stride = NUM_SF_ELEMS_PER_PACK;
+                    int sf_idx = decode_warp_idx * 32 + lane_id;
+                    const auto dim0_offset = token_idx / 128;
+                    const auto dim1_offset = sf_idx / NUM_SF_ELEMS_PER_PACK;
+                    const auto dim2_offset = (token_idx % 128) % 32;
+                    const auto dim3_offset = (token_idx % 128) / 32;
+                    const auto dim4_offset = sf_idx % NUM_SF_ELEMS_PER_PACK;
+                    const auto sf_offset = dim0_offset * dim0_stride + dim1_offset * dim1_stride + dim2_offset * dim2_stride + dim3_offset * dim3_stride + dim4_offset;
+                    static_cast<uint8_t*>(combined_x_scales)[sf_offset] = sf_val;
+                } else {
+                    #pragma unroll
+                    for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
+                        auto combined_pack = __nv_bfloat162(combined_values[k * 2], combined_values[k * 2 + 1]);
+                        tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack);
+                    }
+                    tma_store_fence();
+                    if (elect_one_sync(lane_id)) {
+                        tma_store_1d(tma_st_buffers[decode_warp_idx],
+                                     static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
+                                     kNumBF16PerWarpBytes);
+                    }
                 }
                 __syncwarp();
             }
         }
 
         // Flush all stores
-        tma_store_wait<0>();
+        if constexpr (!kUseNVFP4)
+            tma_store_wait<0>();
     }
 
 //     if (thread_id % 32 == 0) { printf("[R%d,S%d,T%d] combine phase=recv END\n", rank, sm_id, thread_id); }
@@ -1260,14 +1332,15 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
               phases, zero_copy, \
-              src_signals, src_signal_expect_value); } break
+              src_signals, src_signal_expect_value, \
+              nullptr, nullptr); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseNVFP4 = false, bool kUseUE8M0ForNVFP4SF = false>
 __global__ __launch_bounds__(1024, 1) void
 combine(void* combined_x,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
@@ -1280,7 +1353,9 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy,
+        void* combined_x_scales, const float* global_scale_ptr) {
+    EP_STATIC_ASSERT(!(kUseLogFMT && kUseNVFP4), "LogFMT and NVFP4 are mutually exclusive");
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1611,25 +1686,95 @@ combine(void* combined_x,
                         mbarrier_arrive(empty_barriers[stage_idx]);
                     stage_idx = (stage_idx + 1) % kNumStages;
                 }
-                tma_store_wait<0>();
+                if constexpr (!kUseNVFP4)
+                    tma_store_wait<0>();
 
-                #pragma unroll
-                for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
-                    auto combined_pack = __nv_bfloat162(combined_values[k * 2], combined_values[k * 2 + 1]);
-                    tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack);
-                }
-                tma_store_fence();
-                if (elect_one_sync(lane_id)) {
-                    tma_store_1d(tma_st_buffers[decode_warp_idx],
-                                 static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
-                                 kNumBF16PerWarpBytes);
+                if constexpr (kUseNVFP4) {
+                    // Thread-local amax over 16 combined_values
+                    float amax = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < kNumRecvUnrolls * 4 * 2; ++k)
+                        amax = fmaxf(amax, fabsf(combined_values[k]));
+
+                    // Compute scale factor
+                    uint8_t sf_val;
+                    float outputScale;
+                    if constexpr (kUseUE8M0ForNVFP4SF) {
+                        __nv_fp8_e8m0 tmp;
+                        amax *= reciprocal_approximate_ftz(6.0f);
+                        tmp.__x = __nv_cvt_float_to_e8m0(amax, __NV_SATFINITE, cudaRoundPosInf);
+                        sf_val = tmp.__x;
+                        outputScale = exp2f_rcp(sf_val);
+                    } else {
+                        float gs = *global_scale_ptr;
+                        auto SFValue = gs * (amax * reciprocal_approximate_ftz(6.0f));
+                        __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+                        sf_val = tmp.__x;
+                        SFValue = static_cast<float>(tmp);
+                        outputScale = SFValue != 0
+                                          ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(gs))
+                                          : 0.0f;
+                    }
+
+                    // Convert first 8 values to e2m1
+                    float2 fp2Vals_lo[4];
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        fp2Vals_lo[k].x = combined_values[k * 2 + 0] * outputScale;
+                        fp2Vals_lo[k].y = combined_values[k * 2 + 1] * outputScale;
+                    }
+                    uint32_t e2m1_lo = fp32_vec_to_e2m1(fp2Vals_lo);
+
+                    // Convert second 8 values to e2m1
+                    float2 fp2Vals_hi[4];
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        fp2Vals_hi[k].x = combined_values[8 + k * 2 + 0] * outputScale;
+                        fp2Vals_hi[k].y = combined_values[8 + k * 2 + 1] * outputScale;
+                    }
+                    uint32_t e2m1_hi = fp32_vec_to_e2m1(fp2Vals_hi);
+
+                    // Direct global store FP4 data (8 bytes per thread)
+                    auto out_ptr = static_cast<uint32_t*>(combined_x) + token_idx * (kHidden / 4) + (decode_warp_idx * 32 + lane_id) * 2;
+                    out_ptr[0] = e2m1_lo;
+                    out_ptr[1] = e2m1_hi;
+
+                    // Store scale factor in swizzled layout (rm, rk, 32, 4, 4)
+                    constexpr int kNumPerChannels = 16;
+                    constexpr int NUM_SF_ELEMS_PER_PACK = 4;
+                    const auto rk = align<int>(kHidden / kNumPerChannels, 4) / 4;
+                    const auto dim0_stride = rk * 128 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim1_stride = 128 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim2_stride = 4 * NUM_SF_ELEMS_PER_PACK;
+                    const auto dim3_stride = NUM_SF_ELEMS_PER_PACK;
+                    int sf_idx = decode_warp_idx * 32 + lane_id;
+                    const auto dim0_offset = token_idx / 128;
+                    const auto dim1_offset = sf_idx / NUM_SF_ELEMS_PER_PACK;
+                    const auto dim2_offset = (token_idx % 128) % 32;
+                    const auto dim3_offset = (token_idx % 128) / 32;
+                    const auto dim4_offset = sf_idx % NUM_SF_ELEMS_PER_PACK;
+                    const auto sf_offset = dim0_offset * dim0_stride + dim1_offset * dim1_stride + dim2_offset * dim2_stride + dim3_offset * dim3_stride + dim4_offset;
+                    static_cast<uint8_t*>(combined_x_scales)[sf_offset] = sf_val;
+                } else {
+                    #pragma unroll
+                    for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
+                        auto combined_pack = __nv_bfloat162(combined_values[k * 2], combined_values[k * 2 + 1]);
+                        tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack);
+                    }
+                    tma_store_fence();
+                    if (elect_one_sync(lane_id)) {
+                        tma_store_1d(tma_st_buffers[decode_warp_idx],
+                                     static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
+                                     kNumBF16PerWarpBytes);
+                    }
                 }
                 __syncwarp();
             }
         }
 
         // Flush all stores
-        tma_store_wait<0>();
+        if constexpr (!kUseNVFP4)
+            tma_store_wait<0>();
     }
 }
 
@@ -1712,12 +1857,138 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
-              phases, zero_copy); } break
+              phases, zero_copy, \
+              nullptr, nullptr); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
+
+template <bool kUseUE8M0ForSF>
+void combine_nvfp4(void* combined_x, void* combined_x_scales,
+                   const float* global_scale,
+                   void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+                   const void* x, const int64_t* topk_idx, const float* topk_weights,
+                   const int* src_info, const int64_t* layout_range,
+                   int64_t* combine_wait_recv_cost_stats,
+                   int* next_clean, int num_next_clean_int,
+                   int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+                   int num_topk, int num_experts, int rank, int num_ranks,
+                   void* workspace, int num_device_sms,
+                   cudaStream_t stream, int phases, bool zero_copy,
+                   bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value) {
+    if (overlap) {
+        // NOTE reduce combine_send num sm
+        int launch_sms = num_device_sms;
+        if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+            launch_sms = 32;
+        }
+
+        constexpr int kNumMaxTopk = 9;
+        const int num_warp_groups = ceil_div(num_experts, launch_sms);
+        const int num_warps_per_group = 32 / num_warp_groups;
+        const int num_recv_per_sm = ceil_div(num_combined_tokens, launch_sms);
+        EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));
+
+        const auto num_warps = num_warp_groups * num_warps_per_group;
+        const auto num_sms = max(ceil_div(num_experts, num_warp_groups), ceil_div(num_combined_tokens, num_recv_per_sm));
+
+        auto atomic_clean_flag = static_cast<int*>(workspace);
+        EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+        EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+
+        constexpr int kNumStages = 3;
+        constexpr int kNumMaxUnrolls = 4;
+        constexpr int kMaxNumGroups = 2;
+
+        const int num_meta_bytes = hidden / 128 * 4;
+        const int num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16;
+        const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
+        const int num_recv_tma_bytes = 16 + hidden * 2;
+        const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
+        const int smem_size = max(smem_send_size, smem_recv_size);
+
+#define COMBINE_NVFP4_V2_LAUNCH_CASE(hidden) { \
+auto combine_func = combine_v2<false, hidden, kNumMaxTopk, kNumMaxUnrolls, true, kUseUE8M0ForSF>; \
+SET_SHARED_MEMORY_FOR_TMA(combine_func); \
+LAUNCH_KERNEL(&cfg, combine_func, \
+              combined_x, \
+              rdma_recv_x, rdma_recv_flag, rdma_send_x, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              combine_wait_recv_cost_stats, \
+              next_clean, num_next_clean_int, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              num_warp_groups, num_warps_per_group, \
+              phases, zero_copy, \
+              src_signals, src_signal_expect_value, \
+              combined_x_scales, global_scale); } break
+
+        SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+        SWITCH_HIDDEN(COMBINE_NVFP4_V2_LAUNCH_CASE);
+#undef COMBINE_NVFP4_V2_LAUNCH_CASE
+        return;
+    }
+
+    constexpr int kNumMaxTopk = 9;
+    const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+    const int num_warps_per_group = 32 / num_warp_groups;
+    const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
+    EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and num_recv_per_sm >= 0);
+
+    const auto num_warps = num_warp_groups * num_warps_per_group;
+    const auto num_sms = max(ceil_div(num_experts, num_warp_groups),
+                             num_recv_per_sm == 0 ? 1 : ceil_div(num_combined_tokens, num_recv_per_sm));
+
+    auto atomic_clean_flag = static_cast<int*>(workspace);
+    EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+    EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+
+    constexpr int kNumStages = 3;
+    constexpr int kNumMaxUnrolls = 4;
+    constexpr int kMaxNumGroups = 2;
+
+    const int num_meta_bytes = hidden / 128 * 4;
+    const int num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16;
+    const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
+    const int num_recv_tma_bytes = 16 + hidden * 2;
+    const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
+    const int smem_size = max(smem_send_size, smem_recv_size);
+
+#define COMBINE_NVFP4_LAUNCH_CASE(hidden) { \
+auto combine_func = combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, true, kUseUE8M0ForSF>; \
+SET_SHARED_MEMORY_FOR_TMA(combine_func); \
+LAUNCH_KERNEL(&cfg, combine_func, \
+              combined_x, \
+              rdma_recv_x, rdma_recv_flag, rdma_send_x, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              combine_wait_recv_cost_stats, \
+              next_clean, num_next_clean_int, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              num_warp_groups, num_warps_per_group, \
+              phases, zero_copy, \
+              combined_x_scales, global_scale); } break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SWITCH_HIDDEN(COMBINE_NVFP4_LAUNCH_CASE);
+#undef COMBINE_NVFP4_LAUNCH_CASE
+}
+
+// Explicit template instantiations
+template void combine_nvfp4<false>(void*, void*, const float*, void*, int*, void*,
+    const void*, const int64_t*, const float*, const int*, const int64_t*, int64_t*,
+    int*, int, int, int, int, int, int, int, int, void*, int, cudaStream_t, int, bool,
+    bool, uint32_t*, uint32_t);
+template void combine_nvfp4<true>(void*, void*, const float*, void*, int*, void*,
+    const void*, const int64_t*, const float*, const int*, const int64_t*, int64_t*,
+    int*, int, int, int, int, int, int, int, int, void*, int, cudaStream_t, int, bool,
+    bool, uint32_t*, uint32_t);
 
 } // namespace internode_ll
 

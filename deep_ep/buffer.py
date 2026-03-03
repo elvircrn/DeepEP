@@ -614,8 +614,10 @@ class Buffer:
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
-                            overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0) -> \
-            Tuple[torch.Tensor, EventOverlap, Callable]:
+                            overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0,
+                            use_nvfp4: bool = False, use_ue8m0_for_sf: bool = False,
+                            x_global_scale: Optional[torch.Tensor] = None) -> \
+            Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
@@ -643,19 +645,27 @@ class Buffer:
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and pre-cisely localizing slow anomalies.
+            use_nvfp4: whether to enable NVFP4 quantization of the combined output. Mutually exclusive with use_logfmt.
+            use_ue8m0_for_sf: whether to use UE8M0 as NVFP4 scaling factor format (only with `use_nvfp4=True`).
+            x_global_scale: a float32 tensor with dim() == 0, the global scaling factor for NVFP4 quantization.
 
         Returns:
-            combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
+            combined_x: the reduced token tensor. With `use_nvfp4=False`, shape `[num_combined_tokens, hidden]`
+                with type `torch.bfloat16`. With `use_nvfp4=True`, a tuple of (data, scales) matching the dispatch pattern.
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats,
-                                                                   num_max_dispatch_tokens_per_rank, num_experts,
-                                                                   use_logfmt, zero_copy, async_finish, return_recv_hook,
-                                                                   out,
-                                                                   overlap, src_signals, src_signal_expect_value)
+        combined_x, combined_x_scales, event, hook = self.runtime.low_latency_combine(
+            x, topk_idx, topk_weights, src_info, layout_range,
+            combine_wait_recv_cost_stats,
+            num_max_dispatch_tokens_per_rank, num_experts,
+            use_logfmt, zero_copy, async_finish, return_recv_hook,
+            out,
+            overlap, src_signals, src_signal_expect_value,
+            use_nvfp4, use_ue8m0_for_sf, x_global_scale)
+        if use_nvfp4:
+            combined_x = (combined_x, combined_x_scales)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
