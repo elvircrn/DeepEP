@@ -58,7 +58,36 @@ bool support_fabric() {
     return true;
 }
 
-SharedMemoryAllocator::SharedMemoryAllocator() : enable_fabric(support_fabric()) {}
+SharedMemoryAllocator::SharedMemoryAllocator() : enable_fabric(false) {
+    if (support_fabric()) {
+        // Probe: try a small cuMemCreate with FABRIC handles.
+        // If IMEX is not running, this returns CUDA_ERROR_NOT_PERMITTED.
+        CUdevice device;
+        cuCtxGetDevice(&device);
+
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+        prop.location.id = device;
+
+        size_t granularity = 0;
+        cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+
+        CUmemGenericAllocationHandle handle;
+        size_t probe_size = granularity > 0 ? granularity : (1 << 20);
+        CUresult res = cuMemCreate(&handle, probe_size, &prop, 0);
+        if (res == CUDA_SUCCESS) {
+            cuMemRelease(handle);
+            enable_fabric = true;
+        } else {
+            fprintf(stderr, "[DeepEP] WARN: cuMemCreate with FABRIC failed (err=%d), "
+                    "falling back to cudaMalloc + cudaIpc. "
+                    "Start nvidia-imex for fabric support.\n", (int)res);
+            enable_fabric = false;
+        }
+    }
+}
 
 void SharedMemoryAllocator::malloc(void** ptr, size_t size_raw) {
     if (enable_fabric) {
