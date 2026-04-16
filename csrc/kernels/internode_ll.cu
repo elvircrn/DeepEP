@@ -327,6 +327,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                         int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
                         // NOTE(elvircrn): We cannot have NaNs in scales.
                         bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
+						printf(""=======something is happening\n");
                         if (is_nan) printf("=======nan detected in scale=========\n");
                         rdma_x_scales[rdma_x_scale_idx] = is_nan ? 0u : sf_val;
                     }
