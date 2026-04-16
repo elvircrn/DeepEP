@@ -323,7 +323,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (lane_id % 2 == 0){
                         EP_DEVICE_ASSERT((i * kNumElemsPerRead) % kNumPerChannels == 0);
                         int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
-                        rdma_x_scales[rdma_x_scale_idx] = sf_val;
+						// NOTE(elvircrn): We cannot have NaNs in scales.
+                        rdma_x_scales[rdma_x_scale_idx] = ((sf_val & 0x7Fu) == 0x7Fu) ? 0u : sf_val;
                         }
                     // Cast into send buffer
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&result);
