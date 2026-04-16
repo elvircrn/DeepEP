@@ -159,6 +159,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec& vec, float SFScaleVal, uint8
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
+	// NOTE(elvircrn)
     auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
@@ -172,6 +173,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec& vec, float SFScaleVal, uint8
   }
 
   if (SFout) {
+	// NOTE(elvircrn) this is not a global write
     // Write the SF to global memory (STG.8).
     *SFout = fp8SFVal;
   }
@@ -323,9 +325,11 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (lane_id % 2 == 0){
                         EP_DEVICE_ASSERT((i * kNumElemsPerRead) % kNumPerChannels == 0);
                         int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
-						// NOTE(elvircrn): We cannot have NaNs in scales.
-                        rdma_x_scales[rdma_x_scale_idx] = ((sf_val & 0x7Fu) == 0x7Fu) ? 0u : sf_val;
-                        }
+                        // NOTE(elvircrn): We cannot have NaNs in scales.
+                        bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
+                        if (is_nan) printf("=======nan detected in scale=========\n");
+                        rdma_x_scales[rdma_x_scale_idx] = is_nan ? 0u : sf_val;
+                    }
                     // Cast into send buffer
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&result);
                 } else {
