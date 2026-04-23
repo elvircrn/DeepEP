@@ -1649,22 +1649,38 @@ void combine(void* combined_x,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy,
              bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value) {
-    if (overlap) {
-        return combine_v2(
-            combined_x,
-            rdma_recv_x, rdma_recv_flag, rdma_send_x,
-            x, topk_idx, topk_weights,
-            src_info, layout_range,
-            combine_wait_recv_cost_stats,
-            next_clean, num_next_clean_int,
-            num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-            num_topk, num_experts, rank, num_ranks,
-            use_logfmt,
-            workspace, num_device_sms,
-            stream, phases, zero_copy,
-            src_signals, src_signal_expect_value
-        );
-    }
+#ifndef ALLOW_COMBINE_V1
+  return combine_v2(
+      combined_x,
+      rdma_recv_x, rdma_recv_flag, rdma_send_x,
+      x, topk_idx, topk_weights,
+      src_info, layout_range,
+      combine_wait_recv_cost_stats,
+      next_clean, num_next_clean_int,
+      num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+      num_topk, num_experts, rank, num_ranks,
+      use_logfmt,
+      workspace, num_device_sms,
+      stream, phases, zero_copy,
+      src_signals, src_signal_expect_value
+  );
+#else
+  if (overlap) {
+    return combine_v2(
+        combined_x,
+        rdma_recv_x, rdma_recv_flag, rdma_send_x,
+        x, topk_idx, topk_weights,
+        src_info, layout_range,
+        combine_wait_recv_cost_stats,
+        next_clean, num_next_clean_int,
+        num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+        num_topk, num_experts, rank, num_ranks,
+        use_logfmt,
+        workspace, num_device_sms,
+        stream, phases, zero_copy,
+        src_signals, src_signal_expect_value
+    );
+  }
 
     constexpr int kNumMaxTopk = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
@@ -1721,6 +1737,8 @@ LAUNCH_KERNEL(&cfg, combine_func, \
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+
+#endif
 }
 
 } // namespace internode_ll
