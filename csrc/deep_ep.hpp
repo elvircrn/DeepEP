@@ -189,7 +189,8 @@ public:
                         int num_max_dispatch_tokens_per_rank, int num_experts,
                         bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                         const std::optional<torch::Tensor>& out = std::nullopt,
-                        bool overlap = false, const std::optional<torch::Tensor>& src_signals = std::nullopt, uint32_t src_signal_expect_value = 0);
+                        bool overlap = false, const std::optional<torch::Tensor>& src_signals = std::nullopt, uint32_t src_signal_expect_value = 0,
+                        bool use_upstream = false);
 
     torch::Tensor
     get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const;

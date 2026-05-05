@@ -168,6 +168,18 @@ void combine(void* combined_x,
              cudaStream_t stream, int phases, bool zero_copy,
              bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value);
 
+void combine_upstream(void* combined_x,
+             void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+             const void* x, const int64_t* topk_idx, const float* topk_weights,
+             const int* src_info, const int64_t* layout_range,
+             int64_t* combine_wait_recv_cost_stats,
+             int* next_clean, int num_next_clean_int,
+             int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+             int num_topk, int num_experts, int rank, int num_ranks,
+             bool use_logfmt,
+             void* workspace, int num_device_sms,
+             cudaStream_t stream, int phases, bool zero_copy);
+
 } // namespace internode_ll
 
 } // namespace deep_ep
