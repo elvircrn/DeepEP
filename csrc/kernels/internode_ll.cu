@@ -791,7 +791,9 @@ combine_v2(void* combined_x,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
         int phases, bool zero_copy,
-        uint32_t* src_signals, uint32_t src_signal_expect_value) {
+        uint32_t* src_signals, uint32_t src_signal_expect_value,
+        bool use_ldg_recv,
+        bool use_fence_proxy_async) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1119,15 +1121,29 @@ combine_v2(void* combined_x,
                             buffer, reinterpret_cast<float2*>(log_amax_buffers[stage_idx]),
                             reinterpret_cast<float2*>(log_amin_buffers[stage_idx]), cast_info_buffers[stage_idx], lane_id);
                     }
-                    if (elect_one_sync(lane_id)) {
-                        int num_casted = 0;
-                        if constexpr (kUseLogFMT) {
-                            const auto& info = cast_info_buffers[stage_idx][num_decode_warps - 1];
-                            num_casted = (info >> 1) + (info & 1);
+                    if (!kUseLogFMT && use_ldg_recv) {
+                        int num_tma_bytes = num_decode_warps * kNumBF16PerWarpBytes;
+                        auto src = reinterpret_cast<const int4*>(buffer);
+                        auto dst = reinterpret_cast<int4*>(tma_ld_buffers[stage_idx]);
+                        int num_int4 = num_tma_bytes / static_cast<int>(sizeof(int4));
+                        for (int j = lane_id; j < num_int4; j += 32)
+                            dst[j] = __ldg(&src[j]);
+                        __syncwarp();
+                        if (elect_one_sync(lane_id))
+                            mbarrier_arrive(full_barriers[stage_idx]);
+                    } else {
+                        if (elect_one_sync(lane_id)) {
+                            int num_casted = 0;
+                            if constexpr (kUseLogFMT) {
+                                const auto& info = cast_info_buffers[stage_idx][num_decode_warps - 1];
+                                num_casted = (info >> 1) + (info & 1);
+                            }
+                            int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
+                            if (use_fence_proxy_async)
+                                asm volatile("fence.proxy.async;");
+                            tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
+                            mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
                         }
-                        int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
-                        tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
-                        mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
                     }
                     __syncwarp();
                     stage_idx = (stage_idx + 1) % kNumStages;
@@ -1207,7 +1223,9 @@ void combine_v2(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy,
-             uint32_t* src_signals, uint32_t src_signal_expect_value) {
+             uint32_t* src_signals, uint32_t src_signal_expect_value,
+             bool use_ldg_recv,
+             bool use_fence_proxy_async) {
     // NOTE reduce combine_send num sm
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
         // TODO let it be configurable
@@ -1264,7 +1282,9 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
               phases, zero_copy, \
-              src_signals, src_signal_expect_value); } break
+              src_signals, src_signal_expect_value, \
+              use_ldg_recv, \
+              use_fence_proxy_async); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
@@ -1284,7 +1304,8 @@ combine(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy,
+        bool use_fence_proxy_async) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1569,6 +1590,8 @@ combine(void* combined_x,
                             num_casted = (info >> 1) + (info & 1);
                         }
                         int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
+                        if (use_fence_proxy_async)
+                            asm volatile("fence.proxy.async;");
                         tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
                         mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
                     }
@@ -1648,7 +1671,9 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy,
-             bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value) {
+             bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value,
+             bool use_ldg_recv,
+             bool use_fence_proxy_async) {
 #ifndef ALLOW_COMBINE_V1
   return combine_v2(
       combined_x,
@@ -1662,7 +1687,9 @@ void combine(void* combined_x,
       use_logfmt,
       workspace, num_device_sms,
       stream, phases, zero_copy,
-      src_signals, src_signal_expect_value
+      src_signals, src_signal_expect_value,
+      use_ldg_recv,
+      use_fence_proxy_async
   );
 #else
   if (overlap) {
@@ -1678,7 +1705,9 @@ void combine(void* combined_x,
         use_logfmt,
         workspace, num_device_sms,
         stream, phases, zero_copy,
-        src_signals, src_signal_expect_value
+        src_signals, src_signal_expect_value,
+        use_ldg_recv,
+        use_fence_proxy_async
     );
   }
 
@@ -1732,7 +1761,8 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
-              phases, zero_copy); } break
+              phases, zero_copy, \
+              use_fence_proxy_async); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
@@ -1755,7 +1785,8 @@ combine_upstream(void* combined_x,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy,
+        bool use_fence_proxy_async) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2012,6 +2043,8 @@ combine_upstream(void* combined_x,
                             num_casted = (info >> 1) + (info & 1);
                         }
                         int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
+                        if (use_fence_proxy_async)
+                            asm volatile("fence.proxy.async;");
                         tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
                         mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
                     }
@@ -2088,7 +2121,8 @@ void combine_upstream(void* combined_x,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy) {
+             cudaStream_t stream, int phases, bool zero_copy,
+             bool use_fence_proxy_async) {
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -2134,11 +2168,249 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
               num_warp_groups, num_warps_per_group, \
-              phases, zero_copy); } break
+              phases, zero_copy, \
+              use_fence_proxy_async); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_UPSTREAM_LAUNCH_CASE);
 #undef COMBINE_UPSTREAM_LAUNCH_CASE
+}
+
+// ============================================================================
+// combine_v2_local: standalone single-GPU combine (recv phase only)
+// No RDMA, no signaling, no dispatch dependency, no LogFMT
+// Input: expert_x [num_experts, num_max_tokens, hidden] contiguous bf16
+// Output: combined_x [num_combined_tokens, hidden] bf16
+// Via mode: split SMs into senders (write through P2P pointer) and receivers
+//           (TMA load through symmetric pointer) to mimic cross-rank data flow
+// ============================================================================
+
+template <int kHidden, int kNumMaxTopk>
+__global__
+__launch_bounds__(1024, 1)
+void
+combine_v2_local(void* combined_x,
+        const void* expert_x, const int64_t* topk_idx, const float* topk_weights,
+        int num_combined_tokens, int num_topk, int num_max_tokens,
+        size_t bytes_per_slot,
+        void* via_write, const void* via_read, int* via_flags, int num_experts,
+        int via_rank,
+        bool use_fence_proxy_async) {
+
+    const auto sm_id_raw = static_cast<int>(blockIdx.x);
+    const auto num_sms_total = static_cast<int>(gridDim.x);
+    const auto thread_id = static_cast<int>(threadIdx.x);
+
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
+    constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int64_t hidden_bf16_int4 = kHidden / kNumElemsPerInt4;
+    constexpr int kNumRecvUnrolls = 2;
+    constexpr size_t num_bytes_per_token = kHidden * sizeof(nv_bfloat16);
+
+    // Via mode: first half of SMs copy expert_x -> via_write, second half recv from via_read
+    const bool via_mode = (via_write != nullptr);
+    const int num_send_sms = via_mode ? (num_sms_total / 2) : 0;
+
+    if (via_mode && sm_id_raw < num_send_sms) {
+        // ========== SEND PHASE ==========
+        const size_t slot_stride = bytes_per_slot > 0 ? bytes_per_slot : num_bytes_per_token;
+
+        // Resolve P2P pointer for via_write (matches combine_v2 line 1568)
+        uint8_t* write_base = static_cast<uint8_t*>(via_write);
+        if (via_rank >= 0) {
+            auto p2p = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(via_write), via_rank, via_rank);
+            if (p2p != 0)
+                write_base = reinterpret_cast<uint8_t*>(p2p);
+        }
+
+        for (int expert = sm_id_raw; expert < num_experts; expert += num_send_sms) {
+            for (int token = 0; token < num_max_tokens; token++) {
+                const auto src = reinterpret_cast<const int4*>(
+                    static_cast<const uint8_t*>(expert_x) +
+                    (static_cast<size_t>(expert) * num_max_tokens + token) * num_bytes_per_token);
+                auto dst = reinterpret_cast<int4*>(
+                    write_base +
+                    (static_cast<size_t>(expert) * num_max_tokens + token) * slot_stride);
+                for (int i = thread_id; i < static_cast<int>(hidden_bf16_int4); i += static_cast<int>(blockDim.x))
+                    dst[i] = __ldg(&src[i]);
+            }
+            __syncthreads();
+            __threadfence_system();
+            __syncthreads();
+            if (thread_id == 0)
+                st_release_sys_global(via_flags + expert, 1);
+        }
+        return;
+    }
+
+    // ========== RECV PHASE ==========
+    const int sm_id = sm_id_raw - num_send_sms;
+    const int num_sms = num_sms_total - num_send_sms;
+    const void* read_src = via_mode ? via_read : expert_x;
+
+    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+
+    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
+
+    constexpr int kMaxNumGroups = 2;
+    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
+    constexpr int hidden_bf16_int4_pad = align(static_cast<int>(hidden_bf16_int4), 32 * kNumSendUnrolls);
+    const int num_decode_warps = hidden_bf16_int4_pad / (kNumRecvUnrolls * 32);
+    const int num_groups = min(kMaxNumGroups, (blockDim.x / 32) / (num_decode_warps + 1));
+    const int decode_warp_idx = warp_id % (num_decode_warps + 1);
+    const int group_idx = warp_id / (num_decode_warps + 1);
+    EP_DEVICE_ASSERT(num_topk <= 32);
+    EP_DEVICE_ASSERT(num_groups > 0);
+
+    if (group_idx >= num_groups)
+        return;
+
+    constexpr int kNumStages = 3;
+    constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
+    constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
+    constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2;
+
+    const auto smem_group_buffer = smem_buffer + kNumBytesPerGroup * group_idx;
+    auto full_barriers  = PatternVisitor([=](const int& i) { return reinterpret_cast<uint64_t*>(smem_group_buffer + i * kNumTMABufferBytes); });
+    auto empty_barriers = PatternVisitor([=](const int& i) { return reinterpret_cast<uint64_t*>(smem_group_buffer + i * kNumTMABufferBytes + 8); });
+    auto tma_ld_buffers = PatternVisitor([=](const int& i) { return reinterpret_cast<uint8_t* >(smem_group_buffer + i * kNumTMABufferBytes + 16); });
+    auto tma_st_buffers = PatternVisitor([=](const int& i) { return reinterpret_cast<uint32_t*>(smem_group_buffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes); });
+
+    uint32_t tma_phase = 0;
+    EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
+    if (decode_warp_idx == num_decode_warps)
+        tma_phase = (1 << kNumStages) - 1;
+
+    if (decode_warp_idx == num_decode_warps and lane_id < kNumStages) {
+        mbarrier_init(full_barriers[lane_id], 1);
+        mbarrier_init(empty_barriers[lane_id], num_decode_warps);
+    }
+    asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 1), "r"((num_decode_warps + 1) * 32));
+
+    int stage_idx = 0, topk_idx_by_lane = 0;
+    EP_STATIC_ASSERT(kNumMaxTopk <= 32, "Invalid number of topks");
+    if (decode_warp_idx == num_decode_warps) {
+        // TMA load warp
+        for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
+            if (lane_id < num_topk)
+                topk_idx_by_lane = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + lane_id));
+            for (int i = 0; i < num_topk; ++ i) {
+                int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                if (topk_idx_reg < 0)
+                    continue;
+
+                if (via_mode) {
+                    if (elect_one_sync(lane_id))
+                        while (ld_acquire_sys_global(via_flags + topk_idx_reg) == 0);
+                    __syncwarp();
+                }
+
+                mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
+                const size_t slot_stride = bytes_per_slot > 0 ? bytes_per_slot : num_bytes_per_token;
+                auto buffer = static_cast<const uint8_t*>(read_src) +
+                    (static_cast<size_t>(topk_idx_reg) * num_max_tokens + token_idx) * slot_stride;
+                if (elect_one_sync(lane_id)) {
+                    int num_tma_bytes = num_decode_warps * kNumBF16PerWarpBytes;
+                    if (use_fence_proxy_async)
+                        asm volatile("fence.proxy.async;");
+                    tma_load_1d(tma_ld_buffers[stage_idx], buffer, full_barriers[stage_idx], num_tma_bytes);
+                    mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
+                }
+                __syncwarp();
+                stage_idx = (stage_idx + 1) % kNumStages;
+            }
+        }
+    } else {
+        // Reduction warps
+        float topk_weights_by_lane;
+        for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
+            if (lane_id < num_topk) {
+                topk_idx_by_lane = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + lane_id));
+                topk_weights_by_lane = __ldg(topk_weights + token_idx * num_topk + lane_id);
+            }
+            __syncwarp();
+
+            float combined_values[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0f};
+            for (int i = 0; i < num_topk; ++ i) {
+                if (__shfl_sync(0xffffffff, topk_idx_by_lane, i) < 0)
+                    continue;
+                const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
+
+                mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+                int tma_offset = kNumBF16PerWarpBytes * decode_warp_idx;
+                decode_and_accumulate<kNumRecvUnrolls>(
+                    reinterpret_cast<uint32_t*>(tma_ld_buffers[stage_idx] + tma_offset + kNumBF16PerWarpBytes / 32 * lane_id),
+                    combined_values, 0, 0, false, topk_weight
+                );
+
+                if (elect_one_sync(lane_id))
+                    mbarrier_arrive(empty_barriers[stage_idx]);
+                stage_idx = (stage_idx + 1) % kNumStages;
+            }
+            tma_store_wait<0>();
+
+            #pragma unroll
+            for (int k = 0; k < kNumRecvUnrolls * 4; ++ k) {
+                auto combined_pack = __nv_bfloat162(combined_values[k * 2], combined_values[k * 2 + 1]);
+                tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack);
+            }
+            tma_store_fence();
+            if (elect_one_sync(lane_id)) {
+                tma_store_1d(tma_st_buffers[decode_warp_idx],
+                             static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
+                             kNumBF16PerWarpBytes);
+            }
+            __syncwarp();
+        }
+    }
+
+    tma_store_wait<0>();
+}
+
+void combine_v2_local(void* combined_x,
+             const void* expert_x, const int64_t* topk_idx, const float* topk_weights,
+             int num_combined_tokens, int hidden, int num_max_tokens,
+             int num_topk, int num_experts,
+             void* workspace, int num_device_sms,
+             cudaStream_t stream, size_t bytes_per_slot,
+             void* via_write, const void* via_read, int* via_flags,
+             int via_rank,
+             bool use_fence_proxy_async) {
+    constexpr int kNumMaxTopk = 9;
+    constexpr int kNumRecvUnrolls = 2;
+    constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+
+    const int hidden_bf16_int4 = hidden / kNumElemsPerInt4;
+    const int kNumSendUnrolls = hidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
+    const int hidden_bf16_int4_pad_val = ((hidden_bf16_int4 + 32 * kNumSendUnrolls - 1) / (32 * kNumSendUnrolls)) * (32 * kNumSendUnrolls);
+    const int num_decode_warps = hidden_bf16_int4_pad_val / (kNumRecvUnrolls * 32);
+    constexpr int kMaxNumGroups = 2;
+    const int num_groups = std::min(kMaxNumGroups, (1024 / 32) / (num_decode_warps + 1));
+    const int num_warps = (num_decode_warps + 1) * num_groups;
+    const int num_sms = num_device_sms;
+
+    EP_HOST_ASSERT(num_warps * 32 <= 1024);
+    EP_HOST_ASSERT(num_groups > 0);
+
+    constexpr int kNumStages = 3;
+    const int kNumTMABufferBytes = 16 * 2 + hidden * 2;
+    const int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
+    const int smem_size = num_groups * (kNumStages * kNumTMABufferBytes + hidden * 2);
+
+#define COMBINE_LOCAL_LAUNCH_CASE(hidden) { \
+    auto func = combine_v2_local<hidden, kNumMaxTopk>; \
+    SET_SHARED_MEMORY_FOR_TMA(func); \
+    LAUNCH_KERNEL(&cfg, func, \
+              combined_x, expert_x, topk_idx, topk_weights, \
+              num_combined_tokens, num_topk, num_max_tokens, bytes_per_slot, \
+              via_write, via_read, via_flags, num_experts, via_rank, \
+              use_fence_proxy_async); } break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SWITCH_HIDDEN(COMBINE_LOCAL_LAUNCH_CASE);
+#undef COMBINE_LOCAL_LAUNCH_CASE
 }
 
 } // namespace internode_ll

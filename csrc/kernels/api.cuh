@@ -166,7 +166,9 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy,
-             bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value);
+             bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value,
+             bool use_ldg_recv = false,
+             bool use_fence_proxy_async = true);
 
 void combine_upstream(void* combined_x,
              void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
@@ -178,7 +180,19 @@ void combine_upstream(void* combined_x,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
              void* workspace, int num_device_sms,
-             cudaStream_t stream, int phases, bool zero_copy);
+             cudaStream_t stream, int phases, bool zero_copy,
+             bool use_fence_proxy_async = true);
+
+
+void combine_v2_local(void* combined_x,
+             const void* expert_x, const int64_t* topk_idx, const float* topk_weights,
+             int num_combined_tokens, int hidden, int num_max_tokens,
+             int num_topk, int num_experts,
+             void* workspace, int num_device_sms,
+             cudaStream_t stream, size_t bytes_per_slot = 0,
+             void* via_write = nullptr, const void* via_read = nullptr, int* via_flags = nullptr,
+             int via_rank = -1,
+             bool use_fence_proxy_async = true);
 
 } // namespace internode_ll
 

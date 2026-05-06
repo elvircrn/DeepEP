@@ -1403,7 +1403,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                             bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out,
                             bool overlap, const std::optional<torch::Tensor>& src_signals, uint32_t src_signal_expect_value,
-                            bool use_upstream) {
+                            bool use_upstream,
+                            bool use_ldg_recv,
+                            bool use_fence_proxy_async) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
 
@@ -1474,7 +1476,8 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                                   num_topk, num_experts, rank, num_ranks,
                                   use_logfmt,
                                   workspace, num_device_sms,
-                                  launch_stream, phases, zero_copy);
+                                  launch_stream, phases, zero_copy,
+                                  use_fence_proxy_async);
         } else {
             internode_ll::combine(combined_x.data_ptr(),
                                   buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
@@ -1488,7 +1491,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                                   use_logfmt,
                                   workspace, num_device_sms,
                                   launch_stream, phases, zero_copy,
-                                  overlap, src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr, src_signal_expect_value);
+                                  overlap, src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr, src_signal_expect_value,
+                                  use_ldg_recv,
+                                  use_fence_proxy_async);
         }
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
@@ -1584,6 +1589,78 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
+
+    m.def("combine_local", [](const torch::Tensor& expert_x,
+                               const torch::Tensor& topk_idx,
+                               const torch::Tensor& topk_weights,
+                               int num_max_tokens,
+                               int num_experts,
+                               const std::optional<torch::Tensor>& out,
+                               int64_t bytes_per_slot,
+                               int hidden_override,
+                               const std::optional<torch::Tensor>& via_write,
+                               const std::optional<torch::Tensor>& via_read,
+                               const std::optional<torch::Tensor>& via_flags,
+                               int via_rank,
+                               bool use_fence_proxy_async) -> torch::Tensor {
+        EP_HOST_ASSERT(expert_x.is_contiguous());
+        EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous() and topk_idx.scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous() and topk_weights.scalar_type() == torch::kFloat32);
+        EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
+        int hidden;
+        if (hidden_override > 0) {
+            EP_HOST_ASSERT(hidden_override % 128 == 0);
+            hidden = hidden_override;
+        } else {
+            EP_HOST_ASSERT(expert_x.scalar_type() == torch::kBFloat16);
+            EP_HOST_ASSERT(expert_x.dim() == 3);
+            EP_HOST_ASSERT(expert_x.size(0) == num_experts);
+            EP_HOST_ASSERT(expert_x.size(1) == num_max_tokens);
+            EP_HOST_ASSERT(expert_x.size(2) % 128 == 0);
+            hidden = static_cast<int>(expert_x.size(2));
+        }
+        bool use_via = via_write.has_value();
+        if (use_via) {
+            EP_HOST_ASSERT(via_read.has_value() and via_flags.has_value());
+            EP_HOST_ASSERT(via_flags->is_contiguous() and via_flags->scalar_type() == torch::kInt32);
+        }
+        auto num_topk = static_cast<int>(topk_idx.size(1));
+        auto num_combined_tokens = static_cast<int>(topk_idx.size(0));
+        torch::Tensor combined_x;
+        if (out.has_value()) {
+            combined_x = out.value();
+        } else {
+            combined_x = torch::empty({num_combined_tokens, hidden},
+                torch::TensorOptions().dtype(torch::kBFloat16).device(expert_x.device()));
+        }
+        auto workspace = torch::zeros({4}, torch::TensorOptions().dtype(torch::kUInt8).device(expert_x.device()));
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, expert_x.device().index());
+        auto stream = at::cuda::getCurrentCUDAStream();
+        deep_ep::internode_ll::combine_v2_local(
+            combined_x.data_ptr(), expert_x.data_ptr(),
+            topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
+            num_combined_tokens, hidden, num_max_tokens,
+            num_topk, num_experts,
+            workspace.data_ptr(), prop.multiProcessorCount,
+            stream, static_cast<size_t>(bytes_per_slot),
+            use_via ? via_write->data_ptr() : nullptr,
+            use_via ? via_read->data_ptr() : nullptr,
+            use_via ? via_flags->data_ptr<int>() : nullptr,
+            via_rank,
+            use_fence_proxy_async);
+        return combined_x;
+    }, pybind11::arg("expert_x"), pybind11::arg("topk_idx"),
+       pybind11::arg("topk_weights"), pybind11::arg("num_max_tokens"),
+       pybind11::arg("num_experts"),
+       pybind11::arg("out") = pybind11::none(),
+       pybind11::arg("bytes_per_slot") = 0,
+       pybind11::arg("hidden") = 0,
+       pybind11::arg("via_write") = pybind11::none(),
+       pybind11::arg("via_read") = pybind11::none(),
+       pybind11::arg("via_flags") = pybind11::none(),
+       pybind11::arg("via_rank") = -1,
+       pybind11::arg("use_fence_proxy_async") = true);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
 }
