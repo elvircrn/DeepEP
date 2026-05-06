@@ -774,7 +774,7 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
 }
 
 // TODO unify with original code
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseLdgRecv = false>
 __global__
 __launch_bounds__(1024, 1)
 // __maxnreg__(48) // rm
@@ -792,7 +792,6 @@ combine_v2(void* combined_x,
         int num_warp_groups, int num_warps_per_group,
         int phases, bool zero_copy,
         uint32_t* src_signals, uint32_t src_signal_expect_value,
-        bool use_ldg_recv,
         bool use_fence_proxy_async) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
@@ -1121,7 +1120,7 @@ combine_v2(void* combined_x,
                             buffer, reinterpret_cast<float2*>(log_amax_buffers[stage_idx]),
                             reinterpret_cast<float2*>(log_amin_buffers[stage_idx]), cast_info_buffers[stage_idx], lane_id);
                     }
-                    if (!kUseLogFMT && use_ldg_recv) {
+                    if constexpr (!kUseLogFMT && kUseLdgRecv) {
                         int num_tma_bytes = num_decode_warps * kNumBF16PerWarpBytes;
                         auto src = reinterpret_cast<const int4*>(buffer);
                         auto dst = reinterpret_cast<int4*>(tma_ld_buffers[stage_idx]);
@@ -1265,10 +1264,10 @@ void combine_v2(void* combined_x,
     // Total requirement
     const int smem_size = max(smem_send_size, smem_recv_size);
 
-#define COMBINE_LAUNCH_CASE(hidden) { \
+#define COMBINE_V2_LAUNCH(hidden, ldg) { \
 auto combine_func = use_logfmt ? \
-    combine_v2<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : \
-    combine_v2<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+    combine_v2<true, hidden, kNumMaxTopk, kNumMaxUnrolls, ldg> : \
+    combine_v2<false, hidden, kNumMaxTopk, kNumMaxUnrolls, ldg>; \
 SET_SHARED_MEMORY_FOR_TMA(combine_func); \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, \
@@ -1283,12 +1282,16 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_warp_groups, num_warps_per_group, \
               phases, zero_copy, \
               src_signals, src_signal_expect_value, \
-              use_ldg_recv, \
-              use_fence_proxy_async); } break
+              use_fence_proxy_async); }
+
+#define COMBINE_LAUNCH_CASE(hidden) { \
+if (use_ldg_recv) { COMBINE_V2_LAUNCH(hidden, true) } \
+else { COMBINE_V2_LAUNCH(hidden, false) } } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+#undef COMBINE_V2_LAUNCH
 }
 
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
