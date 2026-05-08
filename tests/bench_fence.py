@@ -1,8 +1,9 @@
 # torchrun --nproc-per-node=4 tests/bench_fence.py
-"""Benchmark low-latency dispatch + combine variants.
+"""Benchmark low-latency dispatch + combine variants alongside elastic (v2) kernels.
 
-Measures dispatch-only and full dispatch+combine cycles for combine and
-combine_upstream, all with fence.proxy.async enabled.
+Measures dispatch-only and full dispatch+combine cycles for:
+  - dispatch_v2 / combine_v2 / combine_legacy  (legacy low-latency, NVSHMEM)
+  - elastic_dispatch / elastic_combine          (ElasticBuffer, NCCL Gin)
 """
 import argparse
 import os
@@ -27,7 +28,7 @@ def main():
     parser.add_argument('--num-warmups', type=int, default=50)
     parser.add_argument('--num-tests', type=int, default=1000)
     parser.add_argument('--num-rounds', type=int, default=3)
-    parser.add_argument('--allow-mnnvl', action='store_true')
+    parser.add_argument('--no-mnnvl', action='store_true')
     parser.add_argument('--pack-scale-writes', action='store_true')
     args = parser.parse_args()
 
@@ -39,11 +40,23 @@ def main():
 
     T, H, E, K = args.num_tokens, args.hidden, args.num_experts, args.num_topk
 
+    # Legacy low-latency buffer (NVSHMEM)
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(T, H, num_ranks, E)
     buffer = deep_ep.Buffer(
         group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True,
         num_qps_per_rank=E // num_ranks,
-        allow_mnnvl=args.allow_mnnvl, explicitly_destroy=True)
+        allow_mnnvl=not args.no_mnnvl, explicitly_destroy=True)
+
+    # Elastic buffer (NCCL Gin) — bf16
+    elastic_buf_bf16 = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_fp8_dispatch=False, explicitly_destroy=True)
+    elastic_num_sms = elastic_buf_bf16.get_theoretical_num_sms(E, K)
+
+    # Elastic buffer (NCCL Gin) — fp8
+    elastic_buf_fp8 = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_fp8_dispatch=True, explicitly_destroy=True)
 
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     FLOAT4_E2M1_MAX = 6.0
@@ -55,10 +68,16 @@ def main():
     x_global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(x)).float()
     dist.all_reduce(x_global_scale, op=dist.ReduceOp.MIN, group=group)
 
+    # Precompute FP8 input for elastic fp8 dispatch
+    x_abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    x_fp8_scale = (FLOAT8_E4M3_MAX / x_abs_max).float()
+    x_fp8 = (x.float() * x_fp8_scale).to(torch.float8_e4m3fn)
+    x_fp8_sf = (1.0 / x_fp8_scale).squeeze(-1)
+
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
     formats = ['bf16', 'fp8', 'nvfp4']
-    combine_variants = ['combine', 'upstream']
+    combine_variants = ['combine_v2', 'combine_legacy']
     results = {}
 
     for strategy in strategies:
@@ -109,6 +128,8 @@ def main():
             elif fmt == 'bf16':
                 dispatch_kwargs['use_fp8'] = False
 
+            # --- Legacy low-latency benchmarks ---
+
             def make_clean_dispatch(idx=topk_idx, kw=dispatch_kwargs):
                 def fn():
                     buffer.clean_low_latency_buffer(T, H, E)
@@ -117,7 +138,7 @@ def main():
                 return fn
 
             def make_full(variant, idx=topk_idx, kw=dispatch_kwargs):
-                use_upstream = (variant == 'upstream')
+                use_upstream = (variant == 'combine_legacy')
                 def fn():
                     buffer.clean_low_latency_buffer(T, H, E)
                     _, _, handle, event_d, _ = buffer.low_latency_dispatch(x, idx, T, E, **kw)
@@ -129,20 +150,72 @@ def main():
                     event_c.current_stream_wait()
                 return fn
 
-            rounds = {'dispatch': []}
+            # --- Elastic (v2) benchmarks ---
+
+            def make_elastic_dispatch(idx=topk_idx):
+                ebuf = elastic_buf_fp8 if use_fp8 else elastic_buf_bf16
+                inp = (x_fp8, x_fp8_sf) if use_fp8 else x
+                def fn():
+                    _, _, _, _, ev = ebuf.dispatch(
+                        inp, topk_idx=idx, topk_weights=topk_weights,
+                        num_experts=E, num_max_tokens_per_rank=T,
+                        num_sms=elastic_num_sms,
+                        async_with_compute_stream=True)
+                    ev.current_stream_wait()
+                return fn
+
+            def make_elastic_full(idx=topk_idx):
+                ebuf = elastic_buf_fp8 if use_fp8 else elastic_buf_bf16
+                inp = (x_fp8, x_fp8_sf) if use_fp8 else x
+                def fn():
+                    recv_x, _, _, ehandle, ev_d = ebuf.dispatch(
+                        inp, topk_idx=idx, topk_weights=topk_weights,
+                        num_experts=E, num_max_tokens_per_rank=T,
+                        num_sms=elastic_num_sms,
+                        async_with_compute_stream=True)
+                    ev_d.current_stream_wait()
+                    rx = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+                    expert_out_e = torch.randn_like(rx)
+                    _, _, ev_c = ebuf.combine(
+                        expert_out_e, ehandle, topk_weights=topk_weights,
+                        num_sms=elastic_num_sms,
+                        async_with_compute_stream=True)
+                    ev_c.current_stream_wait()
+                return fn
+
+            rounds = {'dispatch_v2': [], 'elastic_dispatch': []}
             for v in combine_variants:
                 rounds[v] = []
+            rounds['elastic_combine'] = []
 
             for _ in range(args.num_rounds):
+                # Legacy dispatch
                 dist.barrier()
                 avg_cd, _, _ = bench(make_clean_dispatch(), args.num_warmups, args.num_tests)
+
+                # Legacy combine variants
                 for v in combine_variants:
                     dist.barrier()
                     avg_v, _, _ = bench(make_full(v), args.num_warmups, args.num_tests)
                     rounds[v].append(avg_v)
+
+                # Elastic dispatch + combine (skip nvfp4 — not supported)
+                if not use_nvfp4:
+                    dist.barrier()
+                    avg_ed, _, _ = bench(make_elastic_dispatch(), args.num_warmups, args.num_tests)
+                    dist.barrier()
+                    avg_ef, _, _ = bench(make_elastic_full(), args.num_warmups, args.num_tests)
+                else:
+                    avg_ed = float('nan')
+                    avg_ef = float('nan')
+
                 dist.barrier()
 
-                for key, val in [('dispatch', avg_cd)]:
+                # Reduce across ranks (worst-case)
+                for key, val in [('dispatch_v2', avg_cd), ('elastic_dispatch', avg_ed)]:
+                    if val != val:  # nan
+                        rounds[key].append(val)
+                        continue
                     t = torch.tensor([val], dtype=torch.float64, device='cuda')
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     rounds[key].append(t.item())
@@ -150,8 +223,14 @@ def main():
                     t = torch.tensor([rounds[v][-1]], dtype=torch.float64, device='cuda')
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     rounds[v][-1] = t.item()
+                if avg_ef == avg_ef:  # not nan
+                    t = torch.tensor([avg_ef], dtype=torch.float64, device='cuda')
+                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                    rounds['elastic_combine'].append(t.item())
+                else:
+                    rounds['elastic_combine'].append(float('nan'))
 
-            results[(strategy, fmt)] = {k: np.median(v) for k, v in rounds.items()}
+            results[(strategy, fmt)] = {k: np.nanmedian(v) for k, v in rounds.items()}
 
     if rank == 0:
         R = args.num_rounds
@@ -164,19 +243,40 @@ def main():
         print(f'    local-rand  = random offsets mapped to local rank experts (no RDMA, varied experts)')
         print(f'    local-same  = every token picks the same K local experts (no RDMA, hotspot)')
         print(f'    remote-rand = random experts, each from a different remote rank (all cross-rank RDMA)\n')
-        print(f'  {"strategy":<12} {"format":<8} {"dispatch":>10} {"combine":>10} {"upstream":>10}')
-        print(f'  {"":12} {"":8} {"(us)":>10} {"(us)":>10} {"(us)":>10}')
-        print(f'  {"-"*12} {"-"*8} {"-"*10} {"-"*10} {"-"*10}')
+
+        hdr = (f'  {"strategy":<12} {"format":<6} '
+               f'{"dispatch_v2":>12} {"combine_v2":>12} {"combine_legacy":>16} '
+               f'{"elastic_disp":>14} {"elastic_comb":>14}')
+        uline = (f'  {"":12} {"":6} '
+                 f'{"(us)":>12} {"(us)":>12} {"(us)":>16} '
+                 f'{"(us)":>14} {"(us)":>14}')
+        sep = (f'  {"-"*12} {"-"*6} '
+               f'{"-"*12} {"-"*12} {"-"*16} '
+               f'{"-"*14} {"-"*14}')
+        print(hdr)
+        print(uline)
+        print(sep)
         for strategy in strategies:
             for fmt in formats:
                 r = results[(strategy, fmt)]
-                dispatch = r['dispatch'] * 1e6
-                combine = (r['combine'] - r['dispatch']) * 1e6
-                upstream = (r['upstream'] - r['dispatch']) * 1e6
-                print(f'  {strategy:<12} {fmt:<8} {dispatch:>10.1f} {combine:>10.1f} {upstream:>10.1f}')
+                d_v2 = r['dispatch_v2'] * 1e6
+                c_v2 = (r['combine_v2'] - r['dispatch_v2']) * 1e6
+                c_leg = (r['combine_legacy'] - r['dispatch_v2']) * 1e6
+
+                ed = r['elastic_dispatch'] * 1e6
+                ec = (r['elastic_combine'] - r['elastic_dispatch']) * 1e6
+
+                def f(v):
+                    return f'{v:>14.1f}' if v == v else f'{"n/a":>14}'
+
+                print(f'  {strategy:<12} {fmt:<6} '
+                      f'{d_v2:>12.1f} {c_v2:>12.1f} {c_leg:>16.1f} '
+                      f'{f(ed)} {f(ec)}')
         print()
 
     buffer.destroy()
+    elastic_buf_bf16.destroy()
+    elastic_buf_fp8.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
