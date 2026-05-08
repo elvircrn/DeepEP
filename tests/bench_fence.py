@@ -152,9 +152,8 @@ def main():
 
             # --- Elastic (v2) benchmarks ---
 
-            def make_elastic_dispatch(idx=topk_idx):
-                ebuf = elastic_buf_fp8 if use_fp8 else elastic_buf_bf16
-                inp = (x_fp8, x_fp8_sf) if use_fp8 else x
+            def make_elastic_dispatch(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
+                                     inp=(x_fp8, x_fp8_sf) if use_fp8 else x):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
@@ -164,20 +163,19 @@ def main():
                     ev.current_stream_wait()
                 return fn
 
-            def make_elastic_full(idx=topk_idx):
-                ebuf = elastic_buf_fp8 if use_fp8 else elastic_buf_bf16
-                inp = (x_fp8, x_fp8_sf) if use_fp8 else x
+            def make_elastic_full(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
+                                  inp=(x_fp8, x_fp8_sf) if use_fp8 else x):
                 def fn():
-                    recv_x, _, _, ehandle, ev_d = ebuf.dispatch(
+                    recv_x, _, recv_topk_w, ehandle, ev_d = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
                         num_experts=E, num_max_tokens_per_rank=T,
                         num_sms=elastic_num_sms,
                         async_with_compute_stream=True)
                     ev_d.current_stream_wait()
                     rx = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-                    expert_out_e = torch.randn_like(rx)
+                    expert_out_e = torch.empty_like(rx, dtype=torch.bfloat16)
                     _, _, ev_c = ebuf.combine(
-                        expert_out_e, ehandle, topk_weights=topk_weights,
+                        expert_out_e, ehandle, topk_weights=recv_topk_w,
                         num_sms=elastic_num_sms,
                         async_with_compute_stream=True)
                     ev_c.current_stream_wait()
