@@ -72,7 +72,7 @@ def main():
     x_abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
     x_fp8_scale = (FLOAT8_E4M3_MAX / x_abs_max).float()
     x_fp8 = (x.float() * x_fp8_scale).to(torch.float8_e4m3fn)
-    x_fp8_sf = (1.0 / x_fp8_scale).squeeze(-1)
+    x_fp8_sf = (1.0 / x_fp8_scale).view(T, -1)
 
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
