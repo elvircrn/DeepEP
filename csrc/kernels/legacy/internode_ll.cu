@@ -1287,7 +1287,7 @@ __forceinline__ __device__ void decode_and_accumulate(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseLdgRecv = false>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseLdgRecv = false, bool kUseFenceProxyAsync = true>
 __global__
 __launch_bounds__(1024, 1)
 void
@@ -1303,8 +1303,7 @@ combine(void* combined_x,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
         int phases, bool zero_copy,
-        uint32_t* src_signals, uint32_t src_signal_expect_value,
-        bool use_fence_proxy_async) {
+        uint32_t* src_signals, uint32_t src_signal_expect_value) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1603,7 +1602,7 @@ LOW_LATENCY_COMBINE_V2_RECV:
                                 num_casted = (info >> 1) + (info & 1);
                             }
                             int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
-                            if (use_fence_proxy_async)
+                            if constexpr (kUseFenceProxyAsync)
                                 asm volatile("fence.proxy.async;");
                             tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
                             mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes);
@@ -1684,7 +1683,6 @@ void combine(void* combined_x,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy,
              bool overlap, uint32_t* src_signals, uint32_t src_signal_expect_value,
-             bool use_ldg_recv,
              bool use_fence_proxy_async) {
     if ((phases & LEGACY_LOW_LATENCY_RECV_PHASE) == 0)
         num_device_sms = 32;
@@ -1716,10 +1714,10 @@ void combine(void* combined_x,
 
     const int smem_size = max(smem_send_size, smem_recv_size);
 
-#define COMBINE_V2_LAUNCH(hidden, ldg) {                                        \
+#define COMBINE_V2_LAUNCH(hidden, fence) {                                      \
     auto combine_func = use_logfmt ?                                             \
-        combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls, ldg> :                \
-        combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, ldg>;                \
+        combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls, false, fence> :       \
+        combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, false, fence>;       \
     SET_SHARED_MEMORY_FOR_TMA(combine_func);                                     \
     LAUNCH_KERNEL(&cfg, combine_func,                                            \
                   combined_x,                                                    \
@@ -1733,11 +1731,10 @@ void combine(void* combined_x,
                   num_experts, rank, num_ranks,                                  \
                   num_warp_groups, num_warps_per_group,                          \
                   phases, zero_copy,                                             \
-                  src_signals, src_signal_expect_value,                          \
-                  use_fence_proxy_async); }
+                  src_signals, src_signal_expect_value); }
 
 #define COMBINE_LAUNCH_CASE(hidden) {                                            \
-    if (use_ldg_recv) { COMBINE_V2_LAUNCH(hidden, true) }                        \
+    if (use_fence_proxy_async) { COMBINE_V2_LAUNCH(hidden, true) }               \
     else { COMBINE_V2_LAUNCH(hidden, false) } } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
@@ -1746,7 +1743,7 @@ void combine(void* combined_x,
 #undef COMBINE_V2_LAUNCH
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseFenceProxyAsync = true>
 __global__ __launch_bounds__(1024, 1) void combine_upstream(void* combined_x,
                                                    void* rdma_recv_x,
                                                    int* rdma_recv_flag,
@@ -1771,8 +1768,7 @@ __global__ __launch_bounds__(1024, 1) void combine_upstream(void* combined_x,
                                                    int num_warp_groups,
                                                    int num_warps_per_group,
                                                    int phases,
-                                                   bool zero_copy,
-                                                   bool use_fence_proxy_async) {
+                                                   bool zero_copy) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2096,7 +2092,7 @@ LOW_LATENCY_COMBINE_RECV:
                             num_casted = (info >> 1) + (info & 1);
                         }
                         int num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes;
-                        if (use_fence_proxy_async)
+                        if constexpr (kUseFenceProxyAsync)
                             asm volatile("fence.proxy.async;");
                         tma_load_1d(
                             tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes);
@@ -2236,10 +2232,10 @@ void combine_upstream(void* combined_x,
     // Total requirement
     const int smem_size = max(smem_send_size, smem_recv_size);
 
-#define COMBINE_UPSTREAM_LAUNCH_CASE(hidden)                                                                                                            \
-    {                                                                                                                                                  \
-        auto combine_func =                                                                                                                            \
-            use_logfmt ? combine_upstream<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine_upstream<false, hidden, kNumMaxTopk, kNumMaxUnrolls>;    \
+#define COMBINE_UPSTREAM_LAUNCH(hidden, fence) {                                                                                                        \
+        auto combine_func = use_logfmt ?                                                                                                               \
+            combine_upstream<true, hidden, kNumMaxTopk, kNumMaxUnrolls, fence> :                                                                       \
+            combine_upstream<false, hidden, kNumMaxTopk, kNumMaxUnrolls, fence>;                                                                       \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                                       \
         LAUNCH_KERNEL(&cfg,                                                                                                                            \
                       combine_func,                                                                                                                    \
@@ -2267,14 +2263,16 @@ void combine_upstream(void* combined_x,
                       num_warp_groups,                                                                                                                 \
                       num_warps_per_group,                                                                                                             \
                       phases,                                                                                                                          \
-                      zero_copy,                                                                                                                       \
-                      use_fence_proxy_async);                                                                                                          \
-    }                                                                                                                                                  \
-    break
+                      zero_copy); }
+
+#define COMBINE_UPSTREAM_LAUNCH_CASE(hidden) {                                                                                                         \
+    if (use_fence_proxy_async) { COMBINE_UPSTREAM_LAUNCH(hidden, true) }                                                                               \
+    else { COMBINE_UPSTREAM_LAUNCH(hidden, false) } } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_UPSTREAM_LAUNCH_CASE);
 #undef COMBINE_UPSTREAM_LAUNCH_CASE
+#undef COMBINE_UPSTREAM_LAUNCH
 }
 
 template <int kNumThreads>

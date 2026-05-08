@@ -350,7 +350,6 @@ void combine(void* combined_x,
              bool overlap,
              uint32_t* src_signals,
              uint32_t src_signal_expect_value,
-             bool use_ldg_recv = false,
              bool use_fence_proxy_async = true);
 
 void combine_upstream(void* combined_x,

@@ -1676,7 +1676,6 @@ public:
         const std::optional<torch::Tensor>& src_signals = std::nullopt,
         uint32_t src_signal_expect_value = 0,
         bool use_upstream = false,
-        bool use_ldg_recv = false,
         bool use_fence_proxy_async = true) {
         EP_HOST_ASSERT(low_latency_mode);
 
@@ -1793,7 +1792,6 @@ public:
                                       overlap,
                                       src_signals_ptr,
                                       src_signal_expect_value,
-                                      use_ldg_recv,
                                       use_fence_proxy_async);
             }
         };
