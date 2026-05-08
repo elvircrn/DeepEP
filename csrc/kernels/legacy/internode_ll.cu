@@ -1461,7 +1461,7 @@ combine(void* combined_x,
                             tma_store_1d(meta_buffers, cpy_dst_int4_ptr, kNumMetaBytes);
                     }
 
-                    tma_store_wait();
+                    tma_store_wait<0>();
                     __syncwarp();
                 }
 

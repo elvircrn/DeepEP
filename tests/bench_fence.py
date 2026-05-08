@@ -15,8 +15,7 @@ import torch
 import torch.distributed as dist
 import deep_ep
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import bench
+from deep_ep.utils.testing import bench
 
 
 def main():
