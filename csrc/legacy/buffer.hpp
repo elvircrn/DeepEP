@@ -1464,11 +1464,15 @@ public:
                          const torch::Tensor& topk_idx,
                          const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                          const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                         const std::optional<torch::Tensor>& x_global_scale,
                          int num_max_dispatch_tokens_per_rank,
                          int num_experts,
                          bool use_fp8,
                          bool round_scale,
                          bool use_ue8m0,
+                         bool use_nvfp4,
+                         bool use_ue8m0_for_sf,
+                         bool pack_scale_writes,
                          bool async,
                          bool return_recv_hook) {
         EP_HOST_ASSERT(low_latency_mode);
@@ -1513,8 +1517,8 @@ public:
             stream_wait(launch_stream, compute_stream);
 
         // Allocate packed tensors
-        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                          x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, use_nvfp4 ? hidden / 2 : hidden},
+                                          x.options().dtype(use_nvfp4 ? torch::kUInt8 : (use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16)));
         auto packed_recv_src_info =
             torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
@@ -1525,6 +1529,7 @@ public:
         void* packed_recv_x_scales_ptr = nullptr;
         EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
+        EP_HOST_ASSERT(not(use_fp8 and use_nvfp4));
         if (use_fp8) {
             // TODO: support unaligned cases
             EP_HOST_ASSERT(hidden % 512 == 0);
@@ -1538,41 +1543,99 @@ public:
             }
             packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
             packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
+        } else if (use_nvfp4) {
+            constexpr int kNumPerChannels = 16;
+            constexpr int NUM_SF_ELEMS_PER_PACK = 4;
+
+            EP_HOST_ASSERT(hidden % kNumPerChannels == 0);
+            auto l = num_local_experts;
+            auto m = num_ranks * num_max_dispatch_tokens_per_rank;
+            auto rm = (m + 127) / 128;
+            auto rk = (hidden + (kNumPerChannels * NUM_SF_ELEMS_PER_PACK) - 1) / (kNumPerChannels * NUM_SF_ELEMS_PER_PACK);
+            if (use_ue8m0_for_sf) {
+                packed_recv_x_scales = torch::empty({l, rm, rk, 32, 4, 4},
+                                                    torch::dtype(torch::kInt).device(torch::kCUDA));
+            } else {
+                packed_recv_x_scales = torch::empty({l, rm, rk, 32, 4, 4},
+                                                    torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+            }
+            packed_recv_x_scales = packed_recv_x_scales.value().permute({3, 4, 1, 5, 2, 0});
+            packed_recv_x = packed_recv_x.permute({1, 2, 0});
+            packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
+            EP_HOST_ASSERT(packed_recv_x_scales_ptr != nullptr);
         }
 
         // Kernel launch
         auto next_clean_meta = next_buffer.clean_meta();
+        const float* x_global_scale_ptr = x_global_scale.has_value() ? x_global_scale->data_ptr<float>() : nullptr;
         auto launcher = [=, this](int phases) {
-            internode_ll::dispatch(
-                packed_recv_x.data_ptr(),
-                packed_recv_x_scales_ptr,
-                packed_recv_src_info.data_ptr<int>(),
-                packed_recv_layout_range.data_ptr<int64_t>(),
-                packed_recv_count.data_ptr<int>(),
-                mask_buffer_ptr,
-                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
-                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                buffer.dispatch_rdma_recv_data_buffer,
-                buffer.dispatch_rdma_recv_count_buffer,
-                buffer.dispatch_rdma_send_buffer,
-                x.data_ptr(),
-                topk_idx.data_ptr<topk_idx_t>(),
-                next_clean_meta.first,
-                next_clean_meta.second,
-                num_tokens,
-                hidden,
-                num_max_dispatch_tokens_per_rank,
-                num_topk,
-                num_experts,
-                rank,
-                num_ranks,
-                use_fp8,
-                round_scale,
-                use_ue8m0,
-                workspace,
-                num_device_sms,
-                launch_stream,
-                phases);
+            if (use_nvfp4) {
+                internode_ll::dispatch_v2(
+                    packed_recv_x.data_ptr(),
+                    packed_recv_x_scales_ptr,
+                    packed_recv_src_info.data_ptr<int>(),
+                    packed_recv_layout_range.data_ptr<int64_t>(),
+                    packed_recv_count.data_ptr<int>(),
+                    mask_buffer_ptr,
+                    cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                    dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                    x_global_scale_ptr,
+                    buffer.dispatch_rdma_recv_data_buffer,
+                    buffer.dispatch_rdma_recv_count_buffer,
+                    buffer.dispatch_rdma_send_buffer,
+                    x.data_ptr(),
+                    topk_idx.data_ptr<topk_idx_t>(),
+                    next_clean_meta.first,
+                    next_clean_meta.second,
+                    num_tokens,
+                    hidden,
+                    num_max_dispatch_tokens_per_rank,
+                    num_topk,
+                    num_experts,
+                    rank,
+                    num_ranks,
+                    use_fp8,
+                    round_scale,
+                    use_ue8m0,
+                    use_nvfp4,
+                    use_ue8m0_for_sf,
+                    pack_scale_writes,
+                    workspace,
+                    num_device_sms,
+                    launch_stream,
+                    phases);
+            } else {
+                internode_ll::dispatch(
+                    packed_recv_x.data_ptr(),
+                    packed_recv_x_scales_ptr,
+                    packed_recv_src_info.data_ptr<int>(),
+                    packed_recv_layout_range.data_ptr<int64_t>(),
+                    packed_recv_count.data_ptr<int>(),
+                    mask_buffer_ptr,
+                    cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                    dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                    buffer.dispatch_rdma_recv_data_buffer,
+                    buffer.dispatch_rdma_recv_count_buffer,
+                    buffer.dispatch_rdma_send_buffer,
+                    x.data_ptr(),
+                    topk_idx.data_ptr<topk_idx_t>(),
+                    next_clean_meta.first,
+                    next_clean_meta.second,
+                    num_tokens,
+                    hidden,
+                    num_max_dispatch_tokens_per_rank,
+                    num_topk,
+                    num_experts,
+                    rank,
+                    num_ranks,
+                    use_fp8,
+                    round_scale,
+                    use_ue8m0,
+                    workspace,
+                    num_device_sms,
+                    launch_stream,
+                    phases);
+            }
         };
         launcher(return_recv_hook ? LEGACY_LOW_LATENCY_SEND_PHASE : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
 
@@ -1608,7 +1671,13 @@ public:
         bool zero_copy,
         bool async,
         bool return_recv_hook,
-        const std::optional<torch::Tensor>& out = std::nullopt) {
+        const std::optional<torch::Tensor>& out = std::nullopt,
+        bool overlap = false,
+        const std::optional<torch::Tensor>& src_signals = std::nullopt,
+        uint32_t src_signal_expect_value = 0,
+        bool use_upstream = false,
+        bool use_ldg_recv = false,
+        bool use_fence_proxy_async = true) {
         EP_HOST_ASSERT(low_latency_mode);
 
         // Tensor checks
@@ -1665,33 +1734,68 @@ public:
 
         // Kernel launch
         auto next_clean_meta = next_buffer.clean_meta();
+        uint32_t* src_signals_ptr = src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr;
         auto launcher = [=, this](int phases) {
-            internode_ll::combine(combined_x.data_ptr(),
-                                  buffer.combine_rdma_recv_data_buffer,
-                                  buffer.combine_rdma_recv_flag_buffer,
-                                  buffer.combine_rdma_send_buffer,
-                                  x.data_ptr(),
-                                  topk_idx.data_ptr<topk_idx_t>(),
-                                  topk_weights.data_ptr<float>(),
-                                  src_info.data_ptr<int>(),
-                                  layout_range.data_ptr<int64_t>(),
-                                  mask_buffer_ptr,
-                                  combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                                  next_clean_meta.first,
-                                  next_clean_meta.second,
-                                  num_combined_tokens,
-                                  hidden,
-                                  num_max_dispatch_tokens_per_rank,
-                                  num_topk,
-                                  num_experts,
-                                  rank,
-                                  num_ranks,
-                                  use_logfmt,
-                                  workspace,
-                                  num_device_sms,
-                                  launch_stream,
-                                  phases,
-                                  zero_copy);
+            if (use_upstream) {
+                internode_ll::combine_upstream(combined_x.data_ptr(),
+                                      buffer.combine_rdma_recv_data_buffer,
+                                      buffer.combine_rdma_recv_flag_buffer,
+                                      buffer.combine_rdma_send_buffer,
+                                      x.data_ptr(),
+                                      topk_idx.data_ptr<topk_idx_t>(),
+                                      topk_weights.data_ptr<float>(),
+                                      src_info.data_ptr<int>(),
+                                      layout_range.data_ptr<int64_t>(),
+                                      mask_buffer_ptr,
+                                      combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                                      next_clean_meta.first,
+                                      next_clean_meta.second,
+                                      num_combined_tokens,
+                                      hidden,
+                                      num_max_dispatch_tokens_per_rank,
+                                      num_topk,
+                                      num_experts,
+                                      rank,
+                                      num_ranks,
+                                      use_logfmt,
+                                      workspace,
+                                      num_device_sms,
+                                      launch_stream,
+                                      phases,
+                                      zero_copy,
+                                      use_fence_proxy_async);
+            } else {
+                internode_ll::combine(combined_x.data_ptr(),
+                                      buffer.combine_rdma_recv_data_buffer,
+                                      buffer.combine_rdma_recv_flag_buffer,
+                                      buffer.combine_rdma_send_buffer,
+                                      x.data_ptr(),
+                                      topk_idx.data_ptr<topk_idx_t>(),
+                                      topk_weights.data_ptr<float>(),
+                                      src_info.data_ptr<int>(),
+                                      layout_range.data_ptr<int64_t>(),
+                                      combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                                      next_clean_meta.first,
+                                      next_clean_meta.second,
+                                      num_combined_tokens,
+                                      hidden,
+                                      num_max_dispatch_tokens_per_rank,
+                                      num_topk,
+                                      num_experts,
+                                      rank,
+                                      num_ranks,
+                                      use_logfmt,
+                                      workspace,
+                                      num_device_sms,
+                                      launch_stream,
+                                      phases,
+                                      zero_copy,
+                                      overlap,
+                                      src_signals_ptr,
+                                      src_signal_expect_value,
+                                      use_ldg_recv,
+                                      use_fence_proxy_async);
+            }
         };
         launcher(return_recv_hook ? LEGACY_LOW_LATENCY_SEND_PHASE : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
 
