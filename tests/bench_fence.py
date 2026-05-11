@@ -47,16 +47,25 @@ def main():
         num_qps_per_rank=E // num_ranks,
         allow_mnnvl=not args.no_mnnvl, explicitly_destroy=True)
 
-    # Elastic buffer (NCCL Gin) — bf16
+    # Elastic buffer (NCCL Gin) — overlap mode (fewer SMs, leaves room for compute)
     elastic_buf_bf16 = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-        use_fp8_dispatch=False, explicitly_destroy=True)
+        use_fp8_dispatch=False, prefer_overlap_with_compute=True, explicitly_destroy=True)
     elastic_num_sms = elastic_buf_bf16.get_theoretical_num_sms(E, K)
 
-    # Elastic buffer (NCCL Gin) — fp8
     elastic_buf_fp8 = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-        use_fp8_dispatch=True, explicitly_destroy=True)
+        use_fp8_dispatch=True, prefer_overlap_with_compute=True, explicitly_destroy=True)
+
+    # Elastic buffer (NCCL Gin) — standalone mode (more SMs, no overlap)
+    elastic_buf_bf16_full = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_fp8_dispatch=False, prefer_overlap_with_compute=False, explicitly_destroy=True)
+    elastic_num_sms_full = elastic_buf_bf16_full.get_theoretical_num_sms(E, K)
+
+    elastic_buf_fp8_full = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_fp8_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
 
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     FLOAT4_E2M1_MAX = 6.0
@@ -77,7 +86,7 @@ def main():
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
     formats = ['bf16', 'fp8', 'nvfp4']
-    combine_variants = ['combine_v2', 'combine_legacy']
+    combine_variants = ['combine_v2', 'combine_v2_nf', 'combine_legacy', 'combine_legacy_nf']
     results = {}
 
     for strategy in strategies:
@@ -90,22 +99,18 @@ def main():
             scores = torch.randn((1, E), dtype=torch.float32, device='cuda').abs() + 1
             topk_idx = torch.topk(scores, K, dim=-1, largest=True, sorted=True)[1].expand(T, K).contiguous()
         elif strategy == 'local-rand':
-            offsets = torch.randint(0, E, (T, K), device='cuda', dtype=torch.int64)
-            topk_idx = offsets % num_local_experts + local_start
+            # Pick K unique local experts per token via topk on random scores over local experts
+            local_scores = torch.randn((T, num_local_experts), dtype=torch.float32, device='cuda').abs() + 1
+            topk_idx = torch.topk(local_scores, K, dim=-1, largest=True, sorted=True)[1] + local_start
         elif strategy == 'local-same':
-            offsets = torch.arange(K, device='cuda', dtype=torch.int64).unsqueeze(0)
-            topk_idx = (offsets % num_local_experts + local_start).expand(T, K).contiguous()
+            # Every token picks the same K local experts
+            topk_idx = torch.arange(K, device='cuda', dtype=torch.int64).unsqueeze(0) + local_start
+            topk_idx = topk_idx.expand(T, K).contiguous()
         else:
-            remote_ranks = [r for r in range(num_ranks) if r != rank]
-            per_token_idx = []
-            for _ in range(T):
-                picks = []
-                for k in range(K):
-                    r = remote_ranks[k % len(remote_ranks)]
-                    e = torch.randint(0, num_local_experts, (1,)).item()
-                    picks.append(r * num_local_experts + e)
-                per_token_idx.append(picks)
-            topk_idx = torch.tensor(per_token_idx, dtype=torch.int64, device='cuda')
+            # Pick K unique experts from remote ranks via topk on scores zeroed for local rank
+            scores = torch.randn((T, E), dtype=torch.float32, device='cuda').abs() + 1
+            scores[:, local_start:local_start + num_local_experts] = -1
+            topk_idx = torch.topk(scores, K, dim=-1, largest=True, sorted=True)[1]
 
         # Get expert output shape from a bf16 dispatch probe
         buffer.clean_low_latency_buffer(T, H, E)
@@ -138,7 +143,8 @@ def main():
                 return fn
 
             def make_full(variant, idx=topk_idx, kw=dispatch_kwargs):
-                use_upstream = (variant == 'combine_legacy')
+                use_upstream = variant.startswith('combine_legacy')
+                use_fence = not variant.endswith('_nf')
                 def fn():
                     buffer.clean_low_latency_buffer(T, H, E)
                     _, _, handle, event_d, _ = buffer.low_latency_dispatch(x, idx, T, E, **kw)
@@ -146,45 +152,47 @@ def main():
                     _, event_c, _ = buffer.low_latency_combine(
                         expert_output, idx, topk_weights, handle,
                         async_finish=True, return_recv_hook=False,
-                        use_upstream=use_upstream)
+                        use_upstream=use_upstream,
+                        use_fence_proxy_async=use_fence)
                     event_c.current_stream_wait()
                 return fn
 
             # --- Elastic (v2) benchmarks ---
 
             def make_elastic_dispatch(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
-                                     inp=(x_fp8, x_fp8_sf) if use_fp8 else x):
+                                     inp=(x_fp8, x_fp8_sf) if use_fp8 else x, nsms=elastic_num_sms):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
                         num_experts=E, num_max_tokens_per_rank=T,
-                        num_sms=elastic_num_sms,
+                        num_sms=nsms,
                         async_with_compute_stream=True)
                     ev.current_stream_wait()
                 return fn
 
             def make_elastic_full(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
-                                  inp=(x_fp8, x_fp8_sf) if use_fp8 else x):
+                                  inp=(x_fp8, x_fp8_sf) if use_fp8 else x, nsms=elastic_num_sms):
                 def fn():
                     recv_x, _, recv_topk_w, ehandle, ev_d = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
                         num_experts=E, num_max_tokens_per_rank=T,
-                        num_sms=elastic_num_sms,
+                        num_sms=nsms,
                         async_with_compute_stream=True)
                     ev_d.current_stream_wait()
                     rx = recv_x[0] if isinstance(recv_x, tuple) else recv_x
                     expert_out_e = torch.empty_like(rx, dtype=torch.bfloat16)
                     _, _, ev_c = ebuf.combine(
                         expert_out_e, ehandle, topk_weights=recv_topk_w,
-                        num_sms=elastic_num_sms,
+                        num_sms=nsms,
                         async_with_compute_stream=True)
                     ev_c.current_stream_wait()
                 return fn
 
-            rounds = {'dispatch_v2': [], 'elastic_dispatch': []}
+            rounds = {'dispatch_v2': [], 'elastic_dispatch': [], 'elastic_full_dispatch': []}
             for v in combine_variants:
                 rounds[v] = []
             rounds['elastic_combine'] = []
+            rounds['elastic_full_combine'] = []
 
             for _ in range(args.num_rounds):
                 # Legacy dispatch
@@ -197,20 +205,31 @@ def main():
                     avg_v, _, _ = bench(make_full(v), args.num_warmups, args.num_tests)
                     rounds[v].append(avg_v)
 
-                # Elastic dispatch + combine (skip nvfp4 — not supported)
-                if not use_nvfp4:
+                # Elastic dispatch + combine (nvfp4 not supported by elastic)
+                elastic_ok = not use_nvfp4
+                if elastic_ok:
+                    # Overlap mode (fewer SMs)
                     dist.barrier()
                     avg_ed, _, _ = bench(make_elastic_dispatch(), args.num_warmups, args.num_tests)
                     dist.barrier()
                     avg_ef, _, _ = bench(make_elastic_full(), args.num_warmups, args.num_tests)
+                    # Standalone mode (more SMs)
+                    ebuf_full = elastic_buf_fp8_full if use_fp8 else elastic_buf_bf16_full
+                    inp_full = (x_fp8, x_fp8_sf) if use_fp8 else x
+                    dist.barrier()
+                    avg_ed_full, _, _ = bench(make_elastic_dispatch(ebuf=ebuf_full, inp=inp_full, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
+                    dist.barrier()
+                    avg_ef_full, _, _ = bench(make_elastic_full(ebuf=ebuf_full, inp=inp_full, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
                 else:
                     avg_ed = float('nan')
                     avg_ef = float('nan')
+                    avg_ed_full = float('nan')
+                    avg_ef_full = float('nan')
 
                 dist.barrier()
 
                 # Reduce across ranks (worst-case)
-                for key, val in [('dispatch_v2', avg_cd), ('elastic_dispatch', avg_ed)]:
+                for key, val in [('dispatch_v2', avg_cd), ('elastic_dispatch', avg_ed), ('elastic_full_dispatch', avg_ed_full)]:
                     if val != val:  # nan
                         rounds[key].append(val)
                         continue
@@ -221,14 +240,16 @@ def main():
                     t = torch.tensor([rounds[v][-1]], dtype=torch.float64, device='cuda')
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     rounds[v][-1] = t.item()
-                if avg_ef == avg_ef:  # not nan
-                    t = torch.tensor([avg_ef], dtype=torch.float64, device='cuda')
-                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-                    rounds['elastic_combine'].append(t.item())
-                else:
-                    rounds['elastic_combine'].append(float('nan'))
+                for ckey, cval in [('elastic_combine', avg_ef), ('elastic_full_combine', avg_ef_full)]:
+                    if cval == cval:  # not nan
+                        t = torch.tensor([cval], dtype=torch.float64, device='cuda')
+                        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                        rounds[ckey].append(t.item())
+                    else:
+                        rounds[ckey].append(float('nan'))
 
-            results[(strategy, fmt)] = {k: np.nanmedian(v) for k, v in rounds.items()}
+            with np.errstate(all='ignore'):
+                results[(strategy, fmt)] = {k: np.nanmedian(v) for k, v in rounds.items()}
 
     if rank == 0:
         R = args.num_rounds
@@ -242,15 +263,23 @@ def main():
         print(f'    local-same  = every token picks the same K local experts (no RDMA, hotspot)')
         print(f'    remote-rand = random experts, each from a different remote rank (all cross-rank RDMA)\n')
 
-        hdr = (f'  {"strategy":<12} {"format":<6} '
-               f'{"dispatch_v2":>12} {"combine_v2":>12} {"combine_legacy":>16} '
-               f'{"elastic_disp":>14} {"elastic_comb":>14}')
+        print(f'  elastic overlap mode:    num_sms={elastic_num_sms} (prefer_overlap_with_compute=True)')
+        print(f'  elastic standalone mode: num_sms={elastic_num_sms_full} (prefer_overlap_with_compute=False)\n')
+
+        # --- Main table ---
+        hdr = (f'  {"strategy":<12} {"fmt":<6} '
+               f'{"disp_v2":>9} {"comb_v2":>9} {"comb_leg":>9} '
+               f'{"e_disp":>9} {"e_comb":>9} '
+               f'{"ef_disp":>9} {"ef_comb":>9}')
         uline = (f'  {"":12} {"":6} '
-                 f'{"(us)":>12} {"(us)":>12} {"(us)":>16} '
-                 f'{"(us)":>14} {"(us)":>14}')
+                 f'{"(us)":>9} {"(us)":>9} {"(us)":>9} '
+                 f'{"(us)":>9} {"(us)":>9} '
+                 f'{"(us)":>9} {"(us)":>9}')
         sep = (f'  {"-"*12} {"-"*6} '
-               f'{"-"*12} {"-"*12} {"-"*16} '
-               f'{"-"*14} {"-"*14}')
+               f'{"-"*9} {"-"*9} {"-"*9} '
+               f'{"-"*9} {"-"*9} '
+               f'{"-"*9} {"-"*9}')
+        print(f'  legend: e_=elastic overlap, ef_=elastic standalone (full SMs)\n')
         print(hdr)
         print(uline)
         print(sep)
@@ -263,18 +292,56 @@ def main():
 
                 ed = r['elastic_dispatch'] * 1e6
                 ec = (r['elastic_combine'] - r['elastic_dispatch']) * 1e6
+                efd = r['elastic_full_dispatch'] * 1e6
+                efc = (r['elastic_full_combine'] - r['elastic_full_dispatch']) * 1e6
 
                 def f(v):
-                    return f'{v:>14.1f}' if v == v else f'{"n/a":>14}'
+                    return f'{v:>9.1f}' if v == v else f'{"n/a":>9}'
 
                 print(f'  {strategy:<12} {fmt:<6} '
-                      f'{d_v2:>12.1f} {c_v2:>12.1f} {c_leg:>16.1f} '
-                      f'{f(ed)} {f(ec)}')
+                      f'{d_v2:>9.1f} {c_v2:>9.1f} {c_leg:>9.1f} '
+                      f'{f(ed)} {f(ec)} '
+                      f'{f(efd)} {f(efc)}')
+        print()
+
+        # --- Fence overhead table ---
+        print(f'  fence.proxy.async overhead (combine only, fence ON vs OFF)')
+        print(f'  positive delta = fence adds latency\n')
+        fhdr = (f'  {"strategy":<12} {"fmt":<6} '
+                f'{"cv2_on":>9} {"cv2_off":>9} {"delta":>9} {"pct":>7} '
+                f'{"cleg_on":>9} {"cleg_off":>9} {"delta":>9} {"pct":>7}')
+        fuline = (f'  {"":12} {"":6} '
+                  f'{"(us)":>9} {"(us)":>9} {"(us)":>9} {"":>7} '
+                  f'{"(us)":>9} {"(us)":>9} {"(us)":>9} {"":>7}')
+        fsep = (f'  {"-"*12} {"-"*6} '
+                f'{"-"*9} {"-"*9} {"-"*9} {"-"*7} '
+                f'{"-"*9} {"-"*9} {"-"*9} {"-"*7}')
+        print(fhdr)
+        print(fuline)
+        print(fsep)
+        for strategy in strategies:
+            for fmt in formats:
+                r = results[(strategy, fmt)]
+                cv2_on  = (r['combine_v2'] - r['dispatch_v2']) * 1e6
+                cv2_off = (r['combine_v2_nf'] - r['dispatch_v2']) * 1e6
+                cv2_delta = cv2_on - cv2_off
+                cv2_pct = cv2_delta / cv2_off * 100 if cv2_off else 0
+
+                cleg_on  = (r['combine_legacy'] - r['dispatch_v2']) * 1e6
+                cleg_off = (r['combine_legacy_nf'] - r['dispatch_v2']) * 1e6
+                cleg_delta = cleg_on - cleg_off
+                cleg_pct = cleg_delta / cleg_off * 100 if cleg_off else 0
+
+                print(f'  {strategy:<12} {fmt:<6} '
+                      f'{cv2_on:>9.1f} {cv2_off:>9.1f} {cv2_delta:>+9.1f} {cv2_pct:>+6.1f}% '
+                      f'{cleg_on:>9.1f} {cleg_off:>9.1f} {cleg_delta:>+9.1f} {cleg_pct:>+6.1f}%')
         print()
 
     buffer.destroy()
     elastic_buf_bf16.destroy()
     elastic_buf_fp8.destroy()
+    elastic_buf_bf16_full.destroy()
+    elastic_buf_fp8_full.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
