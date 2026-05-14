@@ -1474,7 +1474,8 @@ public:
                          bool use_ue8m0_for_sf,
                          bool pack_scale_writes,
                          bool async,
-                         bool return_recv_hook) {
+                         bool return_recv_hook,
+                         bool use_upstream = false) {
         EP_HOST_ASSERT(low_latency_mode);
 
         // Tensor checks
@@ -1569,7 +1570,38 @@ public:
         auto next_clean_meta = next_buffer.clean_meta();
         const float* x_global_scale_ptr = x_global_scale.has_value() ? x_global_scale->data_ptr<float>() : nullptr;
         auto launcher = [=, this](int phases) {
-            if (use_nvfp4) {
+            if (use_upstream) {
+                internode_ll::dispatch(
+                    packed_recv_x.data_ptr(),
+                    packed_recv_x_scales_ptr,
+                    packed_recv_src_info.data_ptr<int>(),
+                    packed_recv_layout_range.data_ptr<int64_t>(),
+                    packed_recv_count.data_ptr<int>(),
+                    mask_buffer_ptr,
+                    cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                    dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                    buffer.dispatch_rdma_recv_data_buffer,
+                    buffer.dispatch_rdma_recv_count_buffer,
+                    buffer.dispatch_rdma_send_buffer,
+                    x.data_ptr(),
+                    topk_idx.data_ptr<topk_idx_t>(),
+                    next_clean_meta.first,
+                    next_clean_meta.second,
+                    num_tokens,
+                    hidden,
+                    num_max_dispatch_tokens_per_rank,
+                    num_topk,
+                    num_experts,
+                    rank,
+                    num_ranks,
+                    use_fp8,
+                    round_scale,
+                    use_ue8m0,
+                    workspace,
+                    num_device_sms,
+                    launch_stream,
+                    phases);
+            } else {
                 internode_ll::dispatch_v2(
                     packed_recv_x.data_ptr(),
                     packed_recv_x_scales_ptr,
@@ -1600,37 +1632,6 @@ public:
                     use_nvfp4,
                     use_ue8m0_for_sf,
                     pack_scale_writes,
-                    workspace,
-                    num_device_sms,
-                    launch_stream,
-                    phases);
-            } else {
-                internode_ll::dispatch(
-                    packed_recv_x.data_ptr(),
-                    packed_recv_x_scales_ptr,
-                    packed_recv_src_info.data_ptr<int>(),
-                    packed_recv_layout_range.data_ptr<int64_t>(),
-                    packed_recv_count.data_ptr<int>(),
-                    mask_buffer_ptr,
-                    cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
-                    dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                    buffer.dispatch_rdma_recv_data_buffer,
-                    buffer.dispatch_rdma_recv_count_buffer,
-                    buffer.dispatch_rdma_send_buffer,
-                    x.data_ptr(),
-                    topk_idx.data_ptr<topk_idx_t>(),
-                    next_clean_meta.first,
-                    next_clean_meta.second,
-                    num_tokens,
-                    hidden,
-                    num_max_dispatch_tokens_per_rank,
-                    num_topk,
-                    num_experts,
-                    rank,
-                    num_ranks,
-                    use_fp8,
-                    round_scale,
-                    use_ue8m0,
                     workspace,
                     num_device_sms,
                     launch_stream,
