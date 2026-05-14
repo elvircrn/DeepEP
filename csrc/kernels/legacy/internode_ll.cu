@@ -685,7 +685,7 @@ void dispatch(void* packed_recv_x,
 #undef DISPATCH_LAUNCH_CASE
 }
 
-template <bool kUseFP8, bool kUseUE8M0, bool kUseNVFP4, bool kUseUE8M0ForNVFP4SF, bool kPackScaleWrites, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, bool kUseNVFP4, bool kUseUE8M0ForNVFP4SF, bool kPackScaleWrites, bool kEnableNanScaleMasking, int kHidden>
 __global__ __launch_bounds__(1024, 1) void dispatch_v2(void* packed_recv_x,
                                                        void* packed_recv_x_scales,
                                                        int* packed_recv_src_info,
@@ -810,8 +810,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch_v2(void* packed_recv_x,
                     if constexpr (kPackScaleWrites) {
                         uint32_t my_sf = 0;
                         if (lane_id % 2 == 0) {
-                            bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
-                            my_sf = (uint32_t)(is_nan ? 0u : sf_val);
+                            if constexpr (kEnableNanScaleMasking) {
+                                bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
+                                my_sf = (uint32_t)(is_nan ? 0u : sf_val);
+                            } else {
+                                my_sf = (uint32_t)sf_val;
+                            }
                         }
                         int group_leader = (lane_id / 8) * 8;
                         uint32_t b0 = __shfl_sync(0xffffffff, my_sf, group_leader);
@@ -827,8 +831,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch_v2(void* packed_recv_x,
                         if (lane_id % 2 == 0) {
                             EP_DEVICE_ASSERT((i * kNumElemsPerRead) % kNumPerChannels == 0);
                             int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
-                            bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
-                            rdma_x_scales[rdma_x_scale_idx] = is_nan ? 0u : sf_val;
+                            if constexpr (kEnableNanScaleMasking) {
+                                bool is_nan = ((sf_val & 0x7Fu) == 0x7Fu);
+                                rdma_x_scales[rdma_x_scale_idx] = is_nan ? 0u : sf_val;
+                            } else {
+                                rdma_x_scales[rdma_x_scale_idx] = sf_val;
+                            }
                         }
                     }
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&result);
@@ -1073,6 +1081,7 @@ void dispatch_v2(void* packed_recv_x,
               bool use_nvfp4,
               bool use_ue8m0_for_sf,
               bool pack_scale_writes,
+              bool enable_nan_scale_masking,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
@@ -1095,19 +1104,27 @@ void dispatch_v2(void* packed_recv_x,
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
 
 #define DISPATCH_V2_LAUNCH_CASE(hidden) {                                              \
-    auto dispatch_func = dispatch_v2<false, false, false, false, false, hidden>;        \
+    auto dispatch_func = dispatch_v2<false, false, false, false, false, false, hidden>; \
     if (use_fp8 and not use_ue8m0)                                                     \
-        dispatch_func = dispatch_v2<true, false, false, false, false, hidden>;          \
+        dispatch_func = dispatch_v2<true, false, false, false, false, false, hidden>;   \
     if (use_fp8 and use_ue8m0)                                                         \
-        dispatch_func = dispatch_v2<true, true, false, false, false, hidden>;           \
-    if (use_nvfp4 and not use_ue8m0_for_sf and not pack_scale_writes)                  \
-        dispatch_func = dispatch_v2<false, false, true, false, false, hidden>;          \
-    if (use_nvfp4 and use_ue8m0_for_sf and not pack_scale_writes)                      \
-        dispatch_func = dispatch_v2<false, false, true, true, false, hidden>;           \
-    if (use_nvfp4 and not use_ue8m0_for_sf and pack_scale_writes)                      \
-        dispatch_func = dispatch_v2<false, false, true, false, true, hidden>;           \
-    if (use_nvfp4 and use_ue8m0_for_sf and pack_scale_writes)                          \
-        dispatch_func = dispatch_v2<false, false, true, true, true, hidden>;            \
+        dispatch_func = dispatch_v2<true, true, false, false, false, false, hidden>;    \
+    if (use_nvfp4 and not use_ue8m0_for_sf and not pack_scale_writes and not enable_nan_scale_masking)  \
+        dispatch_func = dispatch_v2<false, false, true, false, false, false, hidden>;   \
+    if (use_nvfp4 and use_ue8m0_for_sf and not pack_scale_writes and not enable_nan_scale_masking)      \
+        dispatch_func = dispatch_v2<false, false, true, true, false, false, hidden>;    \
+    if (use_nvfp4 and not use_ue8m0_for_sf and pack_scale_writes and not enable_nan_scale_masking)      \
+        dispatch_func = dispatch_v2<false, false, true, false, true, false, hidden>;    \
+    if (use_nvfp4 and use_ue8m0_for_sf and pack_scale_writes and not enable_nan_scale_masking)          \
+        dispatch_func = dispatch_v2<false, false, true, true, true, false, hidden>;     \
+    if (use_nvfp4 and not use_ue8m0_for_sf and not pack_scale_writes and enable_nan_scale_masking)      \
+        dispatch_func = dispatch_v2<false, false, true, false, false, true, hidden>;    \
+    if (use_nvfp4 and use_ue8m0_for_sf and not pack_scale_writes and enable_nan_scale_masking)          \
+        dispatch_func = dispatch_v2<false, false, true, true, false, true, hidden>;     \
+    if (use_nvfp4 and not use_ue8m0_for_sf and pack_scale_writes and enable_nan_scale_masking)          \
+        dispatch_func = dispatch_v2<false, false, true, false, true, true, hidden>;     \
+    if (use_nvfp4 and use_ue8m0_for_sf and pack_scale_writes and enable_nan_scale_masking)              \
+        dispatch_func = dispatch_v2<false, false, true, true, true, true, hidden>;      \
     LAUNCH_KERNEL(&cfg, dispatch_func,                                                 \
                   packed_recv_x, packed_recv_x_scales,                                 \
                   packed_recv_src_info, packed_recv_layout_range,                       \

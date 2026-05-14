@@ -559,7 +559,8 @@ class Buffer:
                              use_nvfp4: bool = False, use_ue8m0_for_sf: bool = False,
                              pack_scale_writes: bool = False,
                              async_finish: bool = False, return_recv_hook: bool = False,
-                             use_upstream: bool = False) -> \
+                             use_upstream: bool = False,
+                             enable_nan_scale_masking: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -621,7 +622,8 @@ class Buffer:
                                               use_nvfp4, use_ue8m0_for_sf,
                                               pack_scale_writes,
                                               async_finish, return_recv_hook,
-                                              use_upstream)
+                                              use_upstream,
+                                              enable_nan_scale_masking)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
                              packed_recv_layout_range, cumulative_local_expert_recv_stats)

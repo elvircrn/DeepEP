@@ -1475,7 +1475,8 @@ public:
                          bool pack_scale_writes,
                          bool async,
                          bool return_recv_hook,
-                         bool use_upstream = false) {
+                         bool use_upstream = false,
+                         bool enable_nan_scale_masking = false) {
         EP_HOST_ASSERT(low_latency_mode);
 
         // Tensor checks
@@ -1632,6 +1633,7 @@ public:
                     use_nvfp4,
                     use_ue8m0_for_sf,
                     pack_scale_writes,
+                    enable_nan_scale_masking,
                     workspace,
                     num_device_sms,
                     launch_stream,
