@@ -596,10 +596,12 @@ public:
                                          const int& num_max_tokens_per_rank, const int& hidden,
                                          int num_topk, const bool& use_fp8_dispatch,
                                          const bool& use_nvfp4_dispatch,
+                                         const bool& use_fp8_sf,
                                          const bool& allow_hybrid_mode,
                                          const bool& allow_multiple_reduction) {
         EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
         EP_HOST_ASSERT(not (use_fp8_dispatch and use_nvfp4_dispatch));
+        EP_HOST_ASSERT(not use_fp8_sf or use_nvfp4_dispatch);
 
         // The worst case SF bytes must be less than the main part
         EP_HOST_ASSERT(math::ceil_div(hidden, 32) * sizeof(float) <= hidden);
@@ -613,13 +615,13 @@ public:
         const auto is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
 
         // Dispatch size: compute effective hidden dimension and element size per dispatch mode
-        // For NVFP4, elements are 4-bit (2 per byte), so effective_hidden = hidden / 2
+        // For NVFP4 with FP8 scales, 4 scales pack into one sf_pack_t -> hidden/64 packs
         int effective_hidden, elem_size, num_sf_packs;
         if (use_nvfp4_dispatch) {
             EP_HOST_ASSERT(hidden % 64 == 0);
             effective_hidden = hidden / 2;
             elem_size = 1;
-            num_sf_packs = hidden / 16;
+            num_sf_packs = use_fp8_sf ? hidden / 64 : hidden / 16;
         } else if (use_fp8_dispatch) {
             effective_hidden = hidden;
             elem_size = sizeof(__nv_fp8_e4m3);
