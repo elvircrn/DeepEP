@@ -57,6 +57,10 @@ def main():
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
         use_fp8_dispatch=True, prefer_overlap_with_compute=True, explicitly_destroy=True)
 
+    elastic_buf_nvfp4 = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_nvfp4_dispatch=True, prefer_overlap_with_compute=True, explicitly_destroy=True)
+
     # Elastic buffer (NCCL Gin) — standalone mode (more SMs, no overlap)
     elastic_buf_bf16_full = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
@@ -66,6 +70,10 @@ def main():
     elastic_buf_fp8_full = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
         use_fp8_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
+
+    elastic_buf_nvfp4_full = deep_ep.ElasticBuffer(
+        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+        use_nvfp4_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
 
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     FLOAT4_E2M1_MAX = 6.0
@@ -82,6 +90,10 @@ def main():
     x_fp8_scale = (FLOAT8_E4M3_MAX / x_abs_max).float()
     x_fp8 = (x.float() * x_fp8_scale).to(torch.float8_e4m3fn)
     x_fp8_sf = (1.0 / x_fp8_scale).view(T, -1)
+
+    # Precompute NVFP4 input for elastic nvfp4 dispatch
+    from deep_ep.utils.math import per_token_cast_to_nvfp4
+    x_nvfp4, x_nvfp4_sf = per_token_cast_to_nvfp4(x)
 
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
@@ -159,8 +171,21 @@ def main():
 
             # --- Elastic (v2) benchmarks ---
 
-            def make_elastic_dispatch(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
-                                     inp=(x_fp8, x_fp8_sf) if use_fp8 else x, nsms=elastic_num_sms):
+            if use_nvfp4:
+                elastic_inp = (x_nvfp4, x_nvfp4_sf)
+                elastic_ebuf = elastic_buf_nvfp4
+                elastic_ebuf_full = elastic_buf_nvfp4_full
+            elif use_fp8:
+                elastic_inp = (x_fp8, x_fp8_sf)
+                elastic_ebuf = elastic_buf_fp8
+                elastic_ebuf_full = elastic_buf_fp8_full
+            else:
+                elastic_inp = x
+                elastic_ebuf = elastic_buf_bf16
+                elastic_ebuf_full = elastic_buf_bf16_full
+
+            def make_elastic_dispatch(idx=topk_idx, ebuf=elastic_ebuf,
+                                     inp=elastic_inp, nsms=elastic_num_sms):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
@@ -170,8 +195,8 @@ def main():
                     ev.current_stream_wait()
                 return fn
 
-            def make_elastic_full(idx=topk_idx, ebuf=elastic_buf_fp8 if use_fp8 else elastic_buf_bf16,
-                                  inp=(x_fp8, x_fp8_sf) if use_fp8 else x, nsms=elastic_num_sms):
+            def make_elastic_full(idx=topk_idx, ebuf=elastic_ebuf,
+                                  inp=elastic_inp, nsms=elastic_num_sms):
                 def fn():
                     recv_x, _, recv_topk_w, ehandle, ev_d = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
@@ -205,34 +230,22 @@ def main():
                     avg_v, _, _ = bench(make_full(v), args.num_warmups, args.num_tests)
                     rounds[v].append(avg_v)
 
-                # Elastic dispatch + combine (nvfp4 not supported by elastic)
-                elastic_ok = not use_nvfp4
-                if elastic_ok:
-                    # Overlap mode (fewer SMs)
-                    dist.barrier()
-                    avg_ed, _, _ = bench(make_elastic_dispatch(), args.num_warmups, args.num_tests)
-                    dist.barrier()
-                    avg_ef, _, _ = bench(make_elastic_full(), args.num_warmups, args.num_tests)
-                    # Standalone mode (more SMs)
-                    ebuf_full = elastic_buf_fp8_full if use_fp8 else elastic_buf_bf16_full
-                    inp_full = (x_fp8, x_fp8_sf) if use_fp8 else x
-                    dist.barrier()
-                    avg_ed_full, _, _ = bench(make_elastic_dispatch(ebuf=ebuf_full, inp=inp_full, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
-                    dist.barrier()
-                    avg_ef_full, _, _ = bench(make_elastic_full(ebuf=ebuf_full, inp=inp_full, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
-                else:
-                    avg_ed = float('nan')
-                    avg_ef = float('nan')
-                    avg_ed_full = float('nan')
-                    avg_ef_full = float('nan')
+                # Elastic dispatch + combine
+                # Overlap mode (fewer SMs)
+                dist.barrier()
+                avg_ed, _, _ = bench(make_elastic_dispatch(), args.num_warmups, args.num_tests)
+                dist.barrier()
+                avg_ef, _, _ = bench(make_elastic_full(), args.num_warmups, args.num_tests)
+                # Standalone mode (more SMs)
+                dist.barrier()
+                avg_ed_full, _, _ = bench(make_elastic_dispatch(ebuf=elastic_ebuf_full, inp=elastic_inp, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
+                dist.barrier()
+                avg_ef_full, _, _ = bench(make_elastic_full(ebuf=elastic_ebuf_full, inp=elastic_inp, nsms=elastic_num_sms_full), args.num_warmups, args.num_tests)
 
                 dist.barrier()
 
                 # Reduce across ranks (worst-case)
                 for key, val in [('dispatch_v2', avg_cd), ('elastic_dispatch', avg_ed), ('elastic_full_dispatch', avg_ed_full)]:
-                    if val != val:  # nan
-                        rounds[key].append(val)
-                        continue
                     t = torch.tensor([val], dtype=torch.float64, device='cuda')
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     rounds[key].append(t.item())
@@ -241,12 +254,9 @@ def main():
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     rounds[v][-1] = t.item()
                 for ckey, cval in [('elastic_combine', avg_ef), ('elastic_full_combine', avg_ef_full)]:
-                    if cval == cval:  # not nan
-                        t = torch.tensor([cval], dtype=torch.float64, device='cuda')
-                        dist.all_reduce(t, op=dist.ReduceOp.MAX)
-                        rounds[ckey].append(t.item())
-                    else:
-                        rounds[ckey].append(float('nan'))
+                    t = torch.tensor([cval], dtype=torch.float64, device='cuda')
+                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                    rounds[ckey].append(t.item())
 
             with np.errstate(all='ignore'):
                 results[(strategy, fmt)] = {k: np.nanmedian(v) for k, v in rounds.items()}
@@ -295,13 +305,10 @@ def main():
                 efd = r['elastic_full_dispatch'] * 1e6
                 efc = (r['elastic_full_combine'] - r['elastic_full_dispatch']) * 1e6
 
-                def f(v):
-                    return f'{v:>9.1f}' if v == v else f'{"n/a":>9}'
-
                 print(f'  {strategy:<12} {fmt:<6} '
                       f'{d_v2:>9.1f} {c_v2:>9.1f} {c_leg:>9.1f} '
-                      f'{f(ed)} {f(ec)} '
-                      f'{f(efd)} {f(efc)}')
+                      f'{ed:>9.1f} {ec:>9.1f} '
+                      f'{efd:>9.1f} {efc:>9.1f}')
         print()
 
         # --- Fence overhead table ---
@@ -340,8 +347,10 @@ def main():
     buffer.destroy()
     elastic_buf_bf16.destroy()
     elastic_buf_fp8.destroy()
+    elastic_buf_nvfp4.destroy()
     elastic_buf_bf16_full.destroy()
     elastic_buf_fp8_full.destroy()
+    elastic_buf_nvfp4_full.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
