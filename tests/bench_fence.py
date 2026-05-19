@@ -93,7 +93,8 @@ def main():
 
     # Precompute NVFP4 input for elastic nvfp4 dispatch
     from deep_ep.utils.math import per_token_cast_to_nvfp4
-    x_nvfp4, x_nvfp4_sf = per_token_cast_to_nvfp4(x)
+    with torch.compiler.disable():
+        x_nvfp4, x_nvfp4_sf = per_token_cast_to_nvfp4(x)
 
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
