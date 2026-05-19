@@ -20,10 +20,11 @@ from deep_ep.utils.testing import bench_kineto
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
-def enumerate_ep_modes():
+def enumerate_ep_modes(filter_dispatch_format=''):
+    dispatch_formats = (filter_dispatch_format,) if filter_dispatch_format else ('bf16', 'fp8', 'nvfp4', 'nvfp4_fp8sf')
     for do_handle_copy in (1, 0):
         for expert_alignment in (128, 1):
-            for dispatch_format in ('bf16', 'fp8', 'nvfp4', 'nvfp4_fp8sf'):
+            for dispatch_format in dispatch_formats:
                 for num_bias in (0, 1, 2):
                     for with_previous_event in (0, 1):
                         for async_with_compute_stream in (0, 1):
@@ -88,7 +89,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
     # Run all tests
     dist_print('Running all test cases:', once_in_node=True)
     for (do_handle_copy, expert_alignment, use_fp8_dispatch, use_nvfp4_dispatch, use_fp8_sf, num_bias,
-         with_previous_event, async_with_compute_stream, allocate_on_comm_stream) in enumerate_ep_modes():
+         with_previous_event, async_with_compute_stream, allocate_on_comm_stream) in enumerate_ep_modes(args.dispatch_format):
         is_quantized_dispatch = use_fp8_dispatch or use_nvfp4_dispatch
         dispatch_fmt = 'nvfp4' + ('_fp8sf' if use_fp8_sf else '') if use_nvfp4_dispatch else ('fp8' if use_fp8_dispatch else 'bf16')
         dist_print(f' > Testing with '
@@ -577,6 +578,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--ignore-local-traffic', action='store_true', help='Whether to ignore local traffic during bandwidth calculation')
+    parser.add_argument('--dispatch-format', type=str, default='', help='Filter dispatch format (bf16, fp8, nvfp4, nvfp4_fp8sf)')
     args = parser.parse_args()
 
     # Create dump trace directories
