@@ -595,9 +595,11 @@ public:
     static int64_t calculate_buffer_size(const int64_t& nccl_comm,
                                          const int& num_max_tokens_per_rank, const int& hidden,
                                          int num_topk, const bool& use_fp8_dispatch,
+                                         const bool& use_nvfp4_dispatch,
                                          const bool& allow_hybrid_mode,
                                          const bool& allow_multiple_reduction) {
         EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
+        EP_HOST_ASSERT(not (use_fp8_dispatch and use_nvfp4_dispatch));
 
         // The worst case SF bytes must be less than the main part
         EP_HOST_ASSERT(math::ceil_div(hidden, 32) * sizeof(float) <= hidden);
@@ -610,11 +612,25 @@ public:
         const auto [num_scaleout_ranks, num_scaleup_ranks] = nccl::get_logical_domain_size(nccl_comm, allow_hybrid_mode);
         const auto is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
 
-        // Dispatch size
-        const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
-        const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0; // An approximation for number of SF packs
+        // Dispatch size: compute effective hidden dimension and element size per dispatch mode
+        // For NVFP4, elements are 4-bit (2 per byte), so effective_hidden = hidden / 2
+        int effective_hidden, elem_size, num_sf_packs;
+        if (use_nvfp4_dispatch) {
+            EP_HOST_ASSERT(hidden % 64 == 0);
+            effective_hidden = hidden / 2;
+            elem_size = 1;
+            num_sf_packs = hidden / 16;
+        } else if (use_fp8_dispatch) {
+            effective_hidden = hidden;
+            elem_size = sizeof(__nv_fp8_e4m3);
+            num_sf_packs = math::ceil_div(hidden, 32);
+        } else {
+            effective_hidden = hidden;
+            elem_size = sizeof(nv_bfloat16);
+            num_sf_packs = 0;
+        }
         const auto num_dispatch_bytes = get_dispatch_buffer_size(
-            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
+            num_max_tokens_per_rank, effective_hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink);
 

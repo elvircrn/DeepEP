@@ -8,6 +8,7 @@ import deep_ep
 from deep_ep.utils.math import (
     align, count_bytes, calc_diff,
     per_token_cast_back, per_token_cast_to_fp8,
+    per_token_cast_to_nvfp4, per_token_cast_back_nvfp4,
     safe_div
 )
 from deep_ep.utils.gate import get_unbalanced_scores
@@ -22,12 +23,16 @@ from deep_ep.utils.testing import bench_kineto
 def enumerate_ep_modes():
     for do_handle_copy in (1, 0):
         for expert_alignment in (128, 1):
-            for use_fp8_dispatch in (1, 0):
+            for dispatch_format in ('bf16', 'fp8', 'nvfp4', 'nvfp4_fp8sf'):
                 for num_bias in (0, 1, 2):
                     for with_previous_event in (0, 1):
                         for async_with_compute_stream in (0, 1):
                             for allocate_on_comm_stream in ((1, ) if with_previous_event else (0, 1)):
-                                yield (do_handle_copy, expert_alignment, use_fp8_dispatch, num_bias,
+                                use_fp8_dispatch = int(dispatch_format == 'fp8')
+                                use_nvfp4_dispatch = int(dispatch_format in ('nvfp4', 'nvfp4_fp8sf'))
+                                use_fp8_sf = int(dispatch_format == 'nvfp4_fp8sf')
+                                yield (do_handle_copy, expert_alignment,
+                                       use_fp8_dispatch, use_nvfp4_dispatch, use_fp8_sf, num_bias,
                                        with_previous_event, async_with_compute_stream, allocate_on_comm_stream)
 
 
@@ -82,17 +87,22 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
     # Run all tests
     dist_print('Running all test cases:', once_in_node=True)
-    for (do_handle_copy, expert_alignment, use_fp8_dispatch, num_bias,
+    for (do_handle_copy, expert_alignment, use_fp8_dispatch, use_nvfp4_dispatch, use_fp8_sf, num_bias,
          with_previous_event, async_with_compute_stream, allocate_on_comm_stream) in enumerate_ep_modes():
+        is_quantized_dispatch = use_fp8_dispatch or use_nvfp4_dispatch
+        dispatch_fmt = 'nvfp4' + ('_fp8sf' if use_fp8_sf else '') if use_nvfp4_dispatch else ('fp8' if use_fp8_dispatch else 'bf16')
         dist_print(f' > Testing with '
-                   f'{do_handle_copy=}, {expert_alignment=}, {use_fp8_dispatch=}, {num_bias=}, '
+                   f'{do_handle_copy=}, {expert_alignment=}, dispatch={dispatch_fmt}, {num_bias=}, '
                    f'{with_previous_event=}, {async_with_compute_stream=}, {allocate_on_comm_stream=} ...',
                    once_in_node=True)
 
         # Random data
         # TODO: support top-k groups
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        x = per_token_cast_to_fp8(x) if use_fp8_dispatch else x
+        if use_fp8_dispatch:
+            x = per_token_cast_to_fp8(x)
+        elif use_nvfp4_dispatch:
+            x = per_token_cast_to_nvfp4(x, use_fp8_sf=bool(use_fp8_sf))
         bias = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') if num_bias == 1 else None
         if num_bias == 2:
             bias = tuple(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') for _ in range(num_bias))
@@ -103,7 +113,12 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             ref_recv_x, ref_recv_topk_idx, ref_recv_topk_weights, \
                 ref_recv_src_token_idx, ref_num_recv_tokens_per_rank = \
                 ref_dispatch(x, topk_idx, topk_weights, num_max_tokens_per_rank, num_experts)
-            ref_recv_x_bf16 = per_token_cast_back(ref_recv_x[0], ref_recv_x[1]) if use_fp8_dispatch else ref_recv_x
+            if use_fp8_dispatch:
+                ref_recv_x_bf16 = per_token_cast_back(ref_recv_x[0], ref_recv_x[1])
+            elif use_nvfp4_dispatch:
+                ref_recv_x_bf16 = per_token_cast_back_nvfp4(ref_recv_x[0], ref_recv_x[1])
+            else:
+                ref_recv_x_bf16 = ref_recv_x
 
             if args.allow_multiple_reduction:
                 # Should be the same as the trigger condition of DeepEP's hybrid combine, which performs intra-scaleup reduction first
@@ -145,13 +160,23 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             do_handle_copy=do_handle_copy, do_cpu_sync=args.do_cpu_sync)
         recv_x, recv_topk_idx, recv_topk_weights, handle, dispatch_event = \
             launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, dispatch_args)
-        recv_x_bf16 = per_token_cast_back(recv_x[0], recv_x[1]) if use_fp8_dispatch else recv_x
+        if use_fp8_dispatch:
+            recv_x_bf16 = per_token_cast_back(recv_x[0], recv_x[1])
+        elif use_nvfp4_dispatch:
+            recv_x_bf16 = per_token_cast_back_nvfp4(recv_x[0], recv_x[1])
+        else:
+            recv_x_bf16 = recv_x
 
         # Expanding mode
         expanded_dispatch_args = dispatch_args | dict(do_expand=True, use_tma_aligned_col_major_sf=True)
         expanded_recv_x, expanded_recv_topk_idx, expanded_recv_topk_weights, expanded_handle, expanded_dispatch_event = \
             launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, expanded_dispatch_args)
-        expanded_recv_x_bf16 = per_token_cast_back(expanded_recv_x[0], expanded_recv_x[1]) if use_fp8_dispatch else expanded_recv_x
+        if use_fp8_dispatch:
+            expanded_recv_x_bf16 = per_token_cast_back(expanded_recv_x[0], expanded_recv_x[1])
+        elif use_nvfp4_dispatch:
+            expanded_recv_x_bf16 = per_token_cast_back_nvfp4(expanded_recv_x[0], expanded_recv_x[1])
+        else:
+            expanded_recv_x_bf16 = expanded_recv_x
 
         # Cached mode
         cached_dispatch_args = dict(
@@ -351,7 +376,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
             # Make the valid part of the whole tensor for no CPU sync mode
             if not args.do_cpu_sync:
-                if use_fp8_dispatch:
+                if is_quantized_dispatch:
                     recv_x = (recv_x[0][:num_recv_tokens], recv_x[1][:num_recv_tokens])
                     cached_recv_x = (cached_recv_x[0][:num_recv_tokens], cached_recv_x[1][:num_recv_tokens])
                 else:
@@ -389,7 +414,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             expanded_recv_topk_weights = expanded_recv_topk_weights[expanded_safe_indices]
 
             # Cached checks
-            if use_fp8_dispatch:
+            if is_quantized_dispatch:
                 assert torch.equal(recv_x[0], cached_recv_x[0])
                 assert torch.equal(recv_x[1], cached_recv_x[1])
             else:
@@ -442,7 +467,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     check_list = [(ref_recv_topk_weights, check_recv_topk_weights, True)]
                     if check_recv_topk_idx is not None:
                         check_list.append((ref_recv_topk_idx, check_recv_topk_idx, False))
-                    if use_fp8_dispatch:
+                    if is_quantized_dispatch:
                         check_list.append((ref_recv_x[0], check_recv_x[0], False))
                         check_list.append((ref_recv_x[1], check_recv_x[1], False))
                     else:

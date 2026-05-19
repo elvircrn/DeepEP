@@ -36,17 +36,15 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     num_experts_per_rank = num_experts // num_ranks
 
     # Unpack SF
-    use_fp8 = isinstance(x, tuple)
-    x, sf = x if use_fp8 else (x, None)
+    has_sf = isinstance(x, tuple)
+    x, sf = x if has_sf else (x, None)
 
-    # TODO: use SF bytes instead of hardcoded recipe
     num_tokens, hidden = x.size()
     num_tokens_, num_topk = topk_idx.size()
     assert num_tokens == num_tokens_
     if sf is not None:
         num_tokens__, hidden_sf = sf.size()
         assert num_tokens == num_tokens__
-        assert hidden_sf == ceil_div(hidden, 128)
     if topk_weights is not None:
         num_tokens__, num_topk_ = topk_weights.size()
         assert num_tokens == num_tokens__
@@ -70,7 +68,7 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
 
         # Select the data for tokens
         x_to_send = x[indices_to_send]
-        sf_to_send = sf[indices_to_send] if use_fp8 else None
+        sf_to_send = sf[indices_to_send] if has_sf else None
         topk_idx_to_send = topk_idx[indices_to_send]
         topk_weights_to_send = topk_weights[indices_to_send]
         masked_topk_idx = torch.where((expert_start_idx <= topk_idx_to_send) & (topk_idx_to_send < expert_end_idx),
@@ -83,7 +81,7 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         send_src_token_idx_list.append(indices_to_send)
 
     send_x = torch.cat(send_x_list, dim=0)
-    send_sf = torch.cat(send_sf_list, dim=0) if use_fp8 else None
+    send_sf = torch.cat(send_sf_list, dim=0) if has_sf else None
     send_topk_idx = torch.cat(send_topk_idx_list, dim=0)
     send_topk_weights = torch.cat(send_topk_weights_list, dim=0)
     send_src_token_idx = torch.cat(send_src_token_idx_list, dim=0).to(torch.int)
@@ -98,12 +96,12 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     num_send_tokens_per_rank = num_send_tokens_per_rank.tolist()
     num_recv_tokens_per_rank = num_recv_tokens_per_rank.tolist()
     recv_x = torch.empty((num_recv_tokens, hidden), dtype=x.dtype, device=x.device)
-    recv_sf = torch.empty((num_recv_tokens, hidden_sf), dtype=sf.dtype, device=x.device) if use_fp8 else None
+    recv_sf = torch.empty((num_recv_tokens, hidden_sf), dtype=sf.dtype, device=x.device) if has_sf else None
     recv_topk_idx = torch.empty((num_recv_tokens, num_topk), dtype=topk_idx.dtype, device=x.device)
     recv_topk_weights = torch.empty((num_recv_tokens, num_topk), dtype=topk_weights.dtype, device=x.device)
     recv_src_token_idx = torch.empty((num_recv_tokens, ), dtype=torch.int, device=x.device)
     dist.all_to_all_single(recv_x, send_x, num_recv_tokens_per_rank, num_send_tokens_per_rank)
-    if use_fp8:
+    if has_sf:
         dist.all_to_all_single(recv_sf, send_sf, num_recv_tokens_per_rank, num_send_tokens_per_rank)
     dist.all_to_all_single(recv_topk_idx, send_topk_idx, num_recv_tokens_per_rank, num_send_tokens_per_rank)
     dist.all_to_all_single(recv_topk_weights, send_topk_weights, num_recv_tokens_per_rank, num_send_tokens_per_rank)
@@ -117,7 +115,7 @@ def dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     recv_topk_idx.masked_fill_(~mask, -1)
 
     # Pack SF
-    recv_x = (recv_x, recv_sf) if use_fp8 else recv_x
+    recv_x = (recv_x, recv_sf) if has_sf else recv_x
 
     return (recv_x, recv_topk_idx, recv_topk_weights,
             recv_src_token_idx, torch.tensor(num_recv_tokens_per_rank, dtype=torch.int))

@@ -129,6 +129,7 @@ class ElasticBuffer:
                  hidden: int = 0,
                  num_topk: int = 0,
                  use_fp8_dispatch: bool = False,
+                 use_nvfp4_dispatch: bool = False,
                  # Configs
                  deterministic: bool = False,
                  allow_hybrid_mode: bool = True,
@@ -148,6 +149,9 @@ class ElasticBuffer:
             hidden: the hidden dimension of each token.
             num_topk: the number of top-k experts per token.
             use_fp8_dispatch: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
+            use_nvfp4_dispatch: whether to enable NVFP4 (4-bit E2M1) dispatch. Input must be a tuple of
+                packed uint8 tensor ``[num_tokens, hidden // 2]`` and float32 scaling factors
+                ``[num_tokens, hidden // 16]``. Cannot be used together with ``use_fp8_dispatch``.
             deterministic: whether to use deterministic routing algorithms.
             allow_hybrid_mode: whether to enable hybrid mode.
             allow_multiple_reduction: whether to allow multiple reductions in combine.
@@ -160,6 +164,8 @@ class ElasticBuffer:
                 otherwise, the resources will be released by the destructor.
         """
         # Some useful utilities
+        assert not (use_fp8_dispatch and use_nvfp4_dispatch), \
+            'Cannot use both FP8 and NVFP4 dispatch simultaneously'
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
@@ -174,6 +180,7 @@ class ElasticBuffer:
             num_bytes = _C.calculate_elastic_buffer_size(
                 self.nccl_comm_handle.get(),
                 num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+                use_nvfp4_dispatch,
                 allow_hybrid_mode, allow_multiple_reduction)
         if os.environ.get('EP_BUFFER_DEBUG', 0):
             print(f'Initializing EP elastic buffer with {num_bytes} bytes at rank EP {group.rank()}/{group.size()}')
@@ -241,6 +248,7 @@ class ElasticBuffer:
     def get_buffer_size_hint(group: dist.ProcessGroup,
                              num_max_tokens_per_rank: int, hidden: int,
                              num_topk: int = 0, use_fp8_dispatch: bool = False,
+                             use_nvfp4_dispatch: bool = False,
                              allow_hybrid_mode: bool = True,
                              allow_multiple_reduction: bool = True) -> int:
         """
@@ -252,6 +260,7 @@ class ElasticBuffer:
             hidden: the hidden dimension of each token.
             num_topk: the number of top-k experts per token.
             use_fp8_dispatch: whether to use FP8 for dispatch.
+            use_nvfp4_dispatch: whether to use NVFP4 (4-bit E2M1) for dispatch.
             allow_hybrid_mode: whether to enable hybrid mode.
             allow_multiple_reduction: whether to allow multiple reductions in combine.
 
@@ -261,6 +270,7 @@ class ElasticBuffer:
         return _C.calculate_elastic_buffer_size(
             get_nccl_comm_handle(group).get(),
             num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+            use_nvfp4_dispatch,
             allow_hybrid_mode, allow_multiple_reduction)
 
     @staticmethod
