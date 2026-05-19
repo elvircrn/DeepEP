@@ -92,9 +92,14 @@ def main():
     x_fp8_sf = (1.0 / x_fp8_scale).view(T, -1)
 
     # Precompute NVFP4 input for elastic nvfp4 dispatch
-    from deep_ep.utils.math import per_token_cast_to_nvfp4
-    with torch.compiler.disable():
-        x_nvfp4, x_nvfp4_sf = per_token_cast_to_nvfp4(x)
+    from deep_ep.utils.math import _float_to_e2m1_packed, align
+    _aligned_n = align(H, 16)
+    _x_padded = torch.nn.functional.pad(x, (0, _aligned_n - H), mode='constant', value=0)
+    _x_view = _x_padded.view(T, -1, 16)
+    _x_amax = _x_view.abs().float().amax(dim=2).view(T, -1).clamp(1e-4)
+    _x_scaled = (_x_view * (6.0 / _x_amax.unsqueeze(2))).float()
+    x_nvfp4 = _float_to_e2m1_packed(_x_scaled.view(T, _aligned_n))[:, :H // 2].contiguous()
+    x_nvfp4_sf = (_x_amax / 6.0).view(T, -1)
 
     num_local_experts = E // num_ranks
     strategies = ['random', 'random-same', 'local-rand', 'local-same', 'remote-rand']
