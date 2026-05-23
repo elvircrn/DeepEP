@@ -1290,7 +1290,7 @@ public:
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};
     }
-    torch::Tensor barrier_test(const int& num_iters, const int& num_sms) const {
+    torch::Tensor barrier_test(const int& num_iters, const int& num_sms, const int& num_experts) const {
         auto timestamps = torch::zeros({num_iters, 2}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kLong));
         launch_barrier_test(
             nccl_context->dev_comm, nccl_context->window,
@@ -1298,7 +1298,7 @@ public:
             timestamps.data_ptr<int64_t>(), num_iters,
             nccl_context->num_scaleup_ranks, num_experts,
             nccl_context->is_scaleup_nvlink,
-            num_sms, num_allocated_qps,
+            num_sms, nccl_context->num_allocated_qps,
             num_gpu_timeout_cycles,
             comm_stream);
         return timestamps;

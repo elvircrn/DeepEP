@@ -439,7 +439,7 @@ public:
         auto func_name = fmt::format("barrier_test_impl<{}, {}, {}, {}, {}, {}, {}>",
             args.is_scaleup_nvlink,
             args.launch_args.grid_dim.first,
-            args.launch_args.block_dim,
+            args.launch_args.num_threads,
             args.num_scaleup_ranks,
             args.num_experts,
             args.num_qps, args.num_timeout_cycles);

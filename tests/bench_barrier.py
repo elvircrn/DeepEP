@@ -29,11 +29,11 @@ def main():
         use_fp8_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
 
     # Warmup
-    ebuf.runtime.barrier_test(50, args.num_sms)
+    ebuf.runtime.barrier_test(50, args.num_sms, args.num_experts)
     torch.cuda.synchronize()
 
     # Timed run
-    ts = ebuf.runtime.barrier_test(args.num_iters, args.num_sms)
+    ts = ebuf.runtime.barrier_test(args.num_iters, args.num_sms, args.num_experts)
     torch.cuda.synchronize()
 
     ts = ts.cpu().numpy()  # (N, 2) — before/after each barrier
