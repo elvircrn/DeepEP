@@ -1290,6 +1290,19 @@ public:
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};
     }
+    torch::Tensor barrier_test(const int& num_iters, const int& num_sms) const {
+        auto timestamps = torch::zeros({num_iters, 2}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kLong));
+        launch_barrier_test(
+            nccl_context->dev_comm, nccl_context->window,
+            workspace, nccl_context->scaleup_rank_idx,
+            timestamps.data_ptr<int64_t>(), num_iters,
+            nccl_context->num_scaleup_ranks, num_experts,
+            nccl_context->is_scaleup_nvlink,
+            num_sms, num_allocated_qps,
+            num_gpu_timeout_cycles,
+            comm_stream);
+        return timestamps;
+    }
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -1311,7 +1324,8 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
-        .def("combine", &ElasticBuffer::combine);
+        .def("combine", &ElasticBuffer::combine)
+        .def("barrier_test", &ElasticBuffer::barrier_test);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
 
     // NCCL communicator handle

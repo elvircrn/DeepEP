@@ -416,4 +416,77 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     DispatchCopyEpilogueRuntime::launch(runtime, args, stream);
 }
 
+class BarrierTestRuntime final : public jit::LaunchRuntime<BarrierTestRuntime> {
+public:
+    struct Args {
+        bool is_scaleup_nvlink;
+        int num_scaleup_ranks;
+        int num_experts;
+        int num_qps;
+        int64_t num_timeout_cycles;
+
+        ncclDevComm_t nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int rank_idx;
+        int64_t* timestamps;
+        int num_iters;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        auto func_name = fmt::format("barrier_test_impl<{}, {}, {}, {}, {}, {}, {}>",
+            args.is_scaleup_nvlink,
+            args.launch_args.grid_dim.first,
+            args.launch_args.block_dim,
+            args.num_scaleup_ranks,
+            args.num_experts,
+            args.num_qps, args.num_timeout_cycles);
+        return fmt::format(R"(
+#include <deep_ep/impls/barrier_test.cuh>
+using namespace deep_ep::elastic;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{});
+}}
+)", func_name);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window,
+            args.workspace, args.rank_idx,
+            args.timestamps, args.num_iters));
+    }
+};
+
+static void launch_barrier_test(
+    const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+    void* workspace, const int& rank_idx,
+    int64_t* timestamps, const int& num_iters,
+    const int& num_scaleup_ranks, const int& num_experts,
+    const bool& is_scaleup_nvlink,
+    const int& num_sms, const int& num_qps,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const int num_threads = 128;
+    const BarrierTestRuntime::Args args = {
+        .is_scaleup_nvlink = is_scaleup_nvlink,
+        .num_scaleup_ranks = num_scaleup_ranks,
+        .num_experts = num_experts,
+        .num_qps = num_qps,
+        .num_timeout_cycles = num_timeout_cycles,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .rank_idx = rank_idx,
+        .timestamps = timestamps,
+        .num_iters = num_iters,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 2 - (num_sms % 2), true)};
+    const auto code = BarrierTestRuntime::generate(args);
+    const auto runtime = jit::compiler->build("barrier_test", code);
+    BarrierTestRuntime::launch(runtime, args, stream);
+}
+
 }  // namespace deep_ep::elastic
