@@ -105,6 +105,8 @@ def main():
     parser.add_argument('--no-mnnvl', action='store_true')
     parser.add_argument('--pack-scale-writes', action='store_true')
     parser.add_argument('--skip-legacy', action='store_true', help='skip legacy (NVSHMEM) benchmarks')
+    parser.add_argument('--sm-counts', type=int, nargs='+', default=None,
+                        help='SM counts to sweep (default: auto-picked range)')
     parser.add_argument('--outlier-threshold', type=float, default=1.5,
                         help='IQR multiplier for outlier fence (default: 1.5)')
     parser.add_argument('--dump-csv', type=str, default=None,
@@ -131,31 +133,32 @@ def main():
             num_qps_per_rank=E // num_ranks,
             allow_mnnvl=not args.no_mnnvl, explicitly_destroy=True)
 
-    elastic_buf_bf16 = deep_ep.ElasticBuffer(
-        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-        use_fp8_dispatch=False, prefer_overlap_with_compute=True, explicitly_destroy=True)
-    elastic_num_sms = elastic_buf_bf16.get_theoretical_num_sms(E, K)
-
-    elastic_buf_fp8 = deep_ep.ElasticBuffer(
-        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-        use_fp8_dispatch=True, prefer_overlap_with_compute=True, explicitly_destroy=True)
-
-    elastic_buf_nvfp4 = deep_ep.ElasticBuffer(
-        group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-        use_nvfp4_dispatch=True, prefer_overlap_with_compute=True, explicitly_destroy=True)
-
-    elastic_buf_bf16_full = deep_ep.ElasticBuffer(
+    # One buffer per format (standalone mode for max QP/capacity headroom)
+    elastic_bufs = {}
+    elastic_bufs['bf16'] = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
         use_fp8_dispatch=False, prefer_overlap_with_compute=False, explicitly_destroy=True)
-    elastic_num_sms_full = elastic_buf_bf16_full.get_theoretical_num_sms(E, K)
-
-    elastic_buf_fp8_full = deep_ep.ElasticBuffer(
+    elastic_bufs['fp8'] = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
         use_fp8_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
-
-    elastic_buf_nvfp4_full = deep_ep.ElasticBuffer(
+    elastic_bufs['nvfp4'] = deep_ep.ElasticBuffer(
         group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
         use_nvfp4_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
+
+    # SM count sweep
+    theoretical_sms = elastic_bufs['bf16'].get_theoretical_num_sms(E, K)
+    device_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if args.sm_counts:
+        sm_counts = sorted(args.sm_counts)
+    else:
+        sm_counts = sorted(set([
+            theoretical_sms,
+            max(1, device_sms // 8),
+            max(1, device_sms // 4),
+            device_sms // 2,
+            device_sms * 3 // 4,
+            device_sms,
+        ]))
 
     # --- Build inputs ---
 
@@ -204,16 +207,11 @@ def main():
 
             if use_nvfp4:
                 elastic_inp = (x_nvfp4, x_nvfp4_sf)
-                elastic_ebuf = elastic_buf_nvfp4
-                elastic_ebuf_full = elastic_buf_nvfp4_full
             elif use_fp8:
                 elastic_inp = (x_fp8, x_fp8_sf)
-                elastic_ebuf = elastic_buf_fp8
-                elastic_ebuf_full = elastic_buf_fp8_full
             else:
                 elastic_inp = x
-                elastic_ebuf = elastic_buf_bf16
-                elastic_ebuf_full = elastic_buf_bf16_full
+            elastic_ebuf = elastic_bufs[fmt]
 
             kernels = {}
 
@@ -227,9 +225,9 @@ def main():
                     return fn
                 kernels['legacy'] = make_legacy()
 
-            # Elastic dispatch (ablate do_expand)
+            # Elastic dispatch (ablate num_sms x do_expand)
             def make_elastic(idx=topk_idx, ebuf=elastic_ebuf,
-                             inp=elastic_inp, nsms=elastic_num_sms,
+                             inp=elastic_inp, nsms=theoretical_sms,
                              expand=False):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
@@ -240,22 +238,10 @@ def main():
                     ev.current_stream_wait()
                 return fn
 
-            def make_elastic_full(idx=topk_idx, ebuf=elastic_ebuf_full,
-                                  inp=elastic_inp, nsms=elastic_num_sms_full,
-                                  expand=False):
-                def fn():
-                    _, _, _, _, ev = ebuf.dispatch(
-                        inp, topk_idx=idx, topk_weights=topk_weights,
-                        num_experts=E, num_max_tokens_per_rank=T,
-                        num_sms=nsms, async_with_compute_stream=True,
-                        do_expand=expand)
-                    ev.current_stream_wait()
-                return fn
-
-            for expand in [False, True]:
-                suffix = '+exp' if expand else ''
-                kernels[f'elastic{suffix}'] = make_elastic(expand=expand)
-                kernels[f'elastic_full{suffix}'] = make_elastic_full(expand=expand)
+            for nsms in sm_counts:
+                for expand in [False, True]:
+                    suffix = '+exp' if expand else ''
+                    kernels[f'sm{nsms}{suffix}'] = make_elastic(nsms=nsms, expand=expand)
 
             for kname, kfn in kernels.items():
                 dist.barrier()
@@ -293,12 +279,9 @@ def main():
         print(f'    local-same  = every token picks same K local experts')
         print(f'    remote-rand = all experts from remote ranks\n')
 
-        print(f'  Kernels:')
-        print(f'    legacy           = NVSHMEM low-latency dispatch')
-        print(f'    elastic          = ElasticBuffer overlap   (num_sms={elastic_num_sms})')
-        print(f'    elastic+exp      = ElasticBuffer overlap   (num_sms={elastic_num_sms}, do_expand=True)')
-        print(f'    elastic_full     = ElasticBuffer standalone (num_sms={elastic_num_sms_full})')
-        print(f'    elastic_full+exp = ElasticBuffer standalone (num_sms={elastic_num_sms_full}, do_expand=True)\n')
+        print(f'  Kernels:  smN = elastic dispatch with N SMs,  +exp = do_expand=True')
+        print(f'  theoretical_sms={theoretical_sms}  device_sms={device_sms}')
+        print(f'  SM sweep: {sm_counts}\n')
 
         # Header
         hdr = (f'  {"strategy":<12} {"fmt":<6} {"kernel":<17} '
@@ -307,7 +290,7 @@ def main():
         units = (f'  {"":12} {"":6} {"":17} '
                  f'{"(us)":>8} {"(us)":>8} {"(us)":>8} {"(us)":>8} '
                  f'{"(us)":>8} {"p99/m":>6} {"":>5} {"":>5}')
-        sep = (f'  {"-"*12} {"-"*6} {"-"*14} '
+        sep = (f'  {"-"*12} {"-"*6} {"-"*17} '
                f'{"-"*8} {"-"*8} {"-"*8} {"-"*8} '
                f'{"-"*8} {"-"*6} {"-"*5} {"-"*5}')
         print(hdr)
@@ -317,8 +300,11 @@ def main():
         flagged = []
         for strategy in strategies:
             for fmt in formats:
-                for kname in (['legacy'] if not args.skip_legacy else []) + [
-                        'elastic', 'elastic+exp', 'elastic_full', 'elastic_full+exp']:
+                elastic_knames = []
+                for nsms in sm_counts:
+                    for expand in [False, True]:
+                        elastic_knames.append(f'sm{nsms}{"+exp" if expand else ""}')
+                for kname in (['legacy'] if not args.skip_legacy else []) + elastic_knames:
                     key = (strategy, fmt, kname)
                     if key not in all_results:
                         continue
@@ -364,12 +350,8 @@ def main():
 
     if buffer is not None:
         buffer.destroy()
-    elastic_buf_bf16.destroy()
-    elastic_buf_fp8.destroy()
-    elastic_buf_nvfp4.destroy()
-    elastic_buf_bf16_full.destroy()
-    elastic_buf_fp8_full.destroy()
-    elastic_buf_nvfp4_full.destroy()
+    for ebuf in elastic_bufs.values():
+        ebuf.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
