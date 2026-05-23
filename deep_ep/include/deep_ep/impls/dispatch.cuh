@@ -40,7 +40,8 @@ dispatch_impl(
     const int sf_token_stride, const int sf_hidden_stride,
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int rank_idx
+    const int rank_idx,
+    int64_t* phase_timestamps
 ) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -69,10 +70,19 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
+    // Phase timestamps (SM 0 only, nullptr = disabled)
+    #define EP_PHASE_TS(phase, cond) \
+        if (phase_timestamps != nullptr && sm_idx == 0 && (cond)) \
+            phase_timestamps[phase] = clock64()
+
+    EP_PHASE_TS(0, thread_idx == 0);
+
     // Barrier without TMA store flush, without prologue grid sync
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+
+    EP_PHASE_TS(1, thread_idx == 0);
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
@@ -146,6 +156,8 @@ dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
+            EP_PHASE_TS(2, thread_idx == 0);
+
             // TODO: for further optimization, we can fuse rank and expert counters
             // Issue scaleup rank count writes to peers
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
@@ -176,6 +188,8 @@ dispatch_impl(
                 }
             }
 
+            EP_PHASE_TS(3, thread_idx == 0);
+
             // This is necessary, as the waited results will rewrite the shared memory
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
@@ -199,6 +213,8 @@ dispatch_impl(
                 }, start_clock);
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            EP_PHASE_TS(4, thread_idx == 0);
 
             // Reduce expert count and add stats
             for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumNotifyThreads) {
@@ -249,6 +265,8 @@ dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
+
+            EP_PHASE_TS(5, thread_idx == 0);
         }
     } else {
         const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
@@ -386,12 +404,17 @@ dispatch_impl(
                 __syncwarp();
             }
         }
+
+        EP_PHASE_TS(6, warp_idx == kNumNotifyWarps && lane_idx == 0);
     }
 
     // Barrier to ensure data arrival
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+
+    EP_PHASE_TS(7, thread_idx == 0);
+    #undef EP_PHASE_TS
 
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();

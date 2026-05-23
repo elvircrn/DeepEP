@@ -119,6 +119,7 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        int64_t* phase_timestamps;
 
         jit::LaunchArgs launch_args;
     };
@@ -178,7 +179,8 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleup_rank_idx));
+                args.scaleup_rank_idx,
+                args.phase_timestamps));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -194,7 +196,8 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleout_rank_idx, args.scaleup_rank_idx
+                args.scaleout_rank_idx, args.scaleup_rank_idx,
+                args.phase_timestamps
             ));
         }
     }
@@ -235,6 +238,7 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& cached_mode,
                             const bool& deterministic,
                             const bool& do_cpu_sync,
+                            int64_t* phase_timestamps,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -299,6 +303,7 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .phase_timestamps = phase_timestamps,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

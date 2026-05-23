@@ -673,7 +673,8 @@ public:
              const bool& async_with_compute_stream,
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
-             const bool& use_tma_aligned_col_major_sf) const {
+             const bool& use_tma_aligned_col_major_sf,
+             const std::optional<torch::Tensor>& phase_timestamps = std::nullopt) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -953,6 +954,7 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, deterministic, do_cpu_sync,
+                        phase_timestamps.has_value() ? phase_timestamps->data_ptr<int64_t>() : nullptr,
                         comm_stream);
 
         // Received token counters

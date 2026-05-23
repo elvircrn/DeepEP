@@ -694,7 +694,8 @@ class ElasticBuffer:
                  do_handle_copy: bool = True,
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
-                 use_tma_aligned_col_major_sf: bool = False) \
+                 use_tma_aligned_col_major_sf: bool = False,
+                 phase_timestamps: Optional[torch.Tensor] = None) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -805,7 +806,8 @@ class ElasticBuffer:
                                         previous_event_before_epilogue,
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
-                                        use_tma_aligned_col_major_sf)
+                                        use_tma_aligned_col_major_sf,
+                                        phase_timestamps)
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,
