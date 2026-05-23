@@ -957,6 +957,17 @@ public:
                         phase_timestamps.has_value() ? phase_timestamps->data_ptr<int64_t>() : nullptr,
                         comm_stream);
 
+        // Skip epilogue + CPU sync when instrumenting (benchmark-only path)
+        if (phase_timestamps.has_value()) {
+            const auto event = stream_control_epilogue(
+                {x, sf, topk_idx, topk_weights},
+                compute_stream,
+                allocate_on_comm_stream, async_with_compute_stream);
+            auto dummy = torch::empty({0}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt));
+            return {dummy, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                    {}, dummy, dummy, dummy, dummy, std::nullopt, std::nullopt, event};
+        }
+
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
         int counter_scaleup_rank_idx = 0, counter_local_expert_idx = 0;
