@@ -78,6 +78,12 @@ def main():
 
     num_sms = args.num_sms if args.num_sms > 0 else ebuf.get_theoretical_num_sms(E, K)
 
+    # Legacy buffer for control comparison
+    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(T, H, num_ranks, E)
+    legacy_buf = deep_ep.Buffer(
+        group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True,
+        num_qps_per_rank=E // num_ranks, explicitly_destroy=True)
+
     # --- Build inputs ---
 
     torch.manual_seed(42 + rank)
@@ -293,7 +299,62 @@ def main():
                                [int(ts[i, j]) for j in range(NUM_PHASES)])
             print(f'  Raw data written to {args.dump_csv}\n')
 
+    # --- Legacy control benchmark (same measurement methodology) ---
+
+    legacy_dispatch_kwargs = dict(use_fp8=use_fp8, async_finish=True, return_recv_hook=False)
+    if use_nvfp4:
+        legacy_dispatch_kwargs['use_nvfp4'] = True
+        legacy_dispatch_kwargs['x_global_scale'] = x_global_scale
+    elif not use_fp8:
+        legacy_dispatch_kwargs['use_fp8'] = False
+
+    for _ in range(W):
+        legacy_buf.clean_low_latency_buffer(T, H, E)
+        _, _, _, event_d, _ = legacy_buf.low_latency_dispatch(x, topk_idx, T, E, **legacy_dispatch_kwargs)
+        event_d.current_stream_wait()
+    torch.cuda.synchronize()
+
+    legacy_start = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
+    legacy_end = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
+
+    for i in range(N):
+        torch.cuda.synchronize()
+        dist.barrier()
+        flush_buf.zero_()
+        torch.cuda.synchronize()
+        legacy_start[i].record()
+        legacy_buf.clean_low_latency_buffer(T, H, E)
+        _, _, _, event_d, _ = legacy_buf.low_latency_dispatch(x, topk_idx, T, E, **legacy_dispatch_kwargs)
+        event_d.current_stream_wait()
+        legacy_end[i].record()
+
+    torch.cuda.synchronize()
+
+    legacy_times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(legacy_start, legacy_end)])
+    legacy_t = torch.tensor(legacy_times, dtype=torch.float64, device='cuda')
+    dist.all_reduce(legacy_t, op=dist.ReduceOp.MAX)
+    legacy_max = legacy_t.cpu().numpy()
+    legacy_us = legacy_max * 1e6
+
+    if rank == 0:
+        lq1, lmed, lq3 = np.percentile(legacy_us, [25, 50, 75])
+        liqr = lq3 - lq1
+        lfence = lq3 + args.outlier_threshold * liqr
+        lsevere = lq3 + 3.0 * liqr
+        lout = int(np.sum(legacy_us > lfence))
+        lsev = int(np.sum(legacy_us > lsevere))
+        lp95 = np.percentile(legacy_us, 95)
+        lp99 = np.percentile(legacy_us, 99)
+
+        print(f'{"="*80}')
+        print(f'  LEGACY CONTROL (same loop, same barrier, same flush)')
+        print(f'{"="*80}')
+        print(f'  Wall-clock (us):  median={lmed:.1f}  p95={lp95:.1f}  p99={lp99:.1f}'
+              f'  max={np.max(legacy_us):.1f}  std={np.std(legacy_us):.1f}')
+        print(f'  Outliers: {lout} mild (>{lfence:.1f}us)  {lsev} severe (>{lsevere:.1f}us)\n')
+
     ebuf.destroy()
+    legacy_buf.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
