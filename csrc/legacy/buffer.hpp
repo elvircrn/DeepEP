@@ -19,6 +19,14 @@
 
 namespace deep_ep::legacy {
 
+void launch_ping_pong_nvshmem(
+    void* rdma_buffer_ptr,
+    const int rank,
+    const int peer_rank,
+    int64_t* timestamps,
+    const int num_iters,
+    const cudaStream_t& stream);
+
 struct Buffer {
     EP_STATIC_ASSERT(LEGACY_NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
@@ -1851,6 +1859,16 @@ public:
         EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
         internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
     }
+
+    torch::Tensor ping_pong(const int& peer_rank, const int& num_iters) {
+        EP_HOST_ASSERT(rdma_buffer_ptr != nullptr and "NVSHMEM buffer must be allocated");
+        auto timestamps = torch::zeros({num_iters, 2}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kLong));
+        launch_ping_pong_nvshmem(
+            rdma_buffer_ptr, rank, peer_rank,
+            timestamps.data_ptr<int64_t>(), num_iters,
+            comm_stream.stream());
+        return timestamps;
+    }
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -1893,7 +1911,8 @@ static void register_apis(pybind11::module_& m) {
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer);
+        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer)
+        .def("ping_pong", &Buffer::ping_pong);
 }
 
 }  // namespace deep_ep::legacy

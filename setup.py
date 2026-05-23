@@ -85,7 +85,7 @@ if __name__ == '__main__':
     extra_link_args = ['-lcuda']
 
     # NVSHMEM flags
-    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
+    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/legacy/ping_pong.cu', 'csrc/kernels/backend/nvshmem.cu'])
     include_dirs.extend([f'{nvshmem_root_dir}/include'])
     library_dirs.extend([f'{nvshmem_root_dir}/lib'])
     nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
