@@ -160,6 +160,7 @@ def main():
         flush_buf.zero_()
         torch.cuda.synchronize()
         dist.barrier()
+        torch.cuda.synchronize()
         start_events[i].record()
         _, _, _, _, ev = ebuf.dispatch(
             inp, topk_idx=topk_idx, topk_weights=topk_weights,
@@ -320,6 +321,7 @@ def main():
         flush_buf.zero_()
         torch.cuda.synchronize()
         dist.barrier()
+        torch.cuda.synchronize()
         legacy_start[i].record()
         legacy_buf.clean_low_latency_buffer(T, H, E)
         _, _, _, event_d, _ = legacy_buf.low_latency_dispatch(x, topk_idx, T, E, **legacy_dispatch_kwargs)
