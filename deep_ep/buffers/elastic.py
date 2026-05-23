@@ -808,6 +808,9 @@ class ElasticBuffer:
                                         do_handle_copy, do_cpu_sync, do_expand,
                                         use_tma_aligned_col_major_sf,
                                         phase_timestamps)
+        if phase_timestamps is not None:
+            return None, None, None, None, EventOverlap(event)
+
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,
