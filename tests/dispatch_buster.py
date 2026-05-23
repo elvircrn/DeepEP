@@ -227,30 +227,35 @@ def main():
                     return fn
                 kernels['legacy'] = make_legacy()
 
-            # Elastic overlap dispatch
+            # Elastic dispatch (ablate do_expand)
             def make_elastic(idx=topk_idx, ebuf=elastic_ebuf,
-                             inp=elastic_inp, nsms=elastic_num_sms):
+                             inp=elastic_inp, nsms=elastic_num_sms,
+                             expand=False):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
                         num_experts=E, num_max_tokens_per_rank=T,
-                        num_sms=nsms, async_with_compute_stream=True)
+                        num_sms=nsms, async_with_compute_stream=True,
+                        do_expand=expand)
                     ev.current_stream_wait()
                 return fn
 
-            # Elastic standalone dispatch
             def make_elastic_full(idx=topk_idx, ebuf=elastic_ebuf_full,
-                                  inp=elastic_inp, nsms=elastic_num_sms_full):
+                                  inp=elastic_inp, nsms=elastic_num_sms_full,
+                                  expand=False):
                 def fn():
                     _, _, _, _, ev = ebuf.dispatch(
                         inp, topk_idx=idx, topk_weights=topk_weights,
                         num_experts=E, num_max_tokens_per_rank=T,
-                        num_sms=nsms, async_with_compute_stream=True)
+                        num_sms=nsms, async_with_compute_stream=True,
+                        do_expand=expand)
                     ev.current_stream_wait()
                 return fn
 
-            kernels['elastic'] = make_elastic()
-            kernels['elastic_full'] = make_elastic_full()
+            for expand in [False, True]:
+                suffix = '+exp' if expand else ''
+                kernels[f'elastic{suffix}'] = make_elastic(expand=expand)
+                kernels[f'elastic_full{suffix}'] = make_elastic_full(expand=expand)
 
             for kname, kfn in kernels.items():
                 dist.barrier()
@@ -289,15 +294,17 @@ def main():
         print(f'    remote-rand = all experts from remote ranks\n')
 
         print(f'  Kernels:')
-        print(f'    legacy       = NVSHMEM low-latency dispatch')
-        print(f'    elastic      = ElasticBuffer overlap mode  (num_sms={elastic_num_sms})')
-        print(f'    elastic_full = ElasticBuffer standalone     (num_sms={elastic_num_sms_full})\n')
+        print(f'    legacy           = NVSHMEM low-latency dispatch')
+        print(f'    elastic          = ElasticBuffer overlap   (num_sms={elastic_num_sms})')
+        print(f'    elastic+exp      = ElasticBuffer overlap   (num_sms={elastic_num_sms}, do_expand=True)')
+        print(f'    elastic_full     = ElasticBuffer standalone (num_sms={elastic_num_sms_full})')
+        print(f'    elastic_full+exp = ElasticBuffer standalone (num_sms={elastic_num_sms_full}, do_expand=True)\n')
 
         # Header
-        hdr = (f'  {"strategy":<12} {"fmt":<6} {"kernel":<14} '
+        hdr = (f'  {"strategy":<12} {"fmt":<6} {"kernel":<17} '
                f'{"median":>8} {"p95":>8} {"p99":>8} {"max":>8} '
                f'{"std":>8} {"tail":>6} {"out":>5} {"sev":>5}')
-        units = (f'  {"":12} {"":6} {"":14} '
+        units = (f'  {"":12} {"":6} {"":17} '
                  f'{"(us)":>8} {"(us)":>8} {"(us)":>8} {"(us)":>8} '
                  f'{"(us)":>8} {"p99/m":>6} {"":>5} {"":>5}')
         sep = (f'  {"-"*12} {"-"*6} {"-"*14} '
@@ -310,7 +317,8 @@ def main():
         flagged = []
         for strategy in strategies:
             for fmt in formats:
-                for kname in (['legacy'] if not args.skip_legacy else []) + ['elastic', 'elastic_full']:
+                for kname in (['legacy'] if not args.skip_legacy else []) + [
+                        'elastic', 'elastic+exp', 'elastic_full', 'elastic_full+exp']:
                     key = (strategy, fmt, kname)
                     if key not in all_results:
                         continue
@@ -322,7 +330,7 @@ def main():
                     elif s['outliers'] > 0:
                         flag = ' *'
 
-                    print(f'  {strategy:<12} {fmt:<6} {kname:<14} '
+                    print(f'  {strategy:<12} {fmt:<6} {kname:<17} '
                           f'{s["median"]:>8.1f} {s["p95"]:>8.1f} {s["p99"]:>8.1f} {s["max"]:>8.1f} '
                           f'{s["std"]:>8.1f} {s["tail_ratio"]:>6.2f} '
                           f'{s["outliers"]:>5d} {s["severe"]:>5d}{flag}')
