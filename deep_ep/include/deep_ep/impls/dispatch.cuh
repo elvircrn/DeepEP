@@ -417,7 +417,7 @@ dispatch_impl(
     #undef EP_PHASE_TS
 
     // Trigger the copy epilogue kernel
-    cudaTriggerProgrammaticLaunchCompletion();
+    // cudaTriggerProgrammaticLaunchCompletion();
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
