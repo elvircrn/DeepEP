@@ -151,6 +151,8 @@ def main():
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
 
     for i in range(N):
+        torch.cuda.synchronize()
+        dist.barrier()
         flush_buf.zero_()
         start_events[i].record()
         _, _, _, _, ev = ebuf.dispatch(
