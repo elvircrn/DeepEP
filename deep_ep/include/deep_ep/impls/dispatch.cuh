@@ -78,9 +78,13 @@ dispatch_impl(
     EP_PHASE_TS(0, thread_idx == 0);
 
     // Barrier without TMA store flush, without prologue grid sync
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    // Skip when phase_timestamps is set (instrumented benchmarks only — caller
+    // must guarantee no concurrent dispatch is in flight)
+    if (phase_timestamps == nullptr) {
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     EP_PHASE_TS(1, thread_idx == 0);
 

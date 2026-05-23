@@ -172,20 +172,18 @@ def main():
     dist.all_reduce(times_t, op=dist.ReduceOp.MAX)
     times_max = times_t.cpu().numpy()
 
-    # Phase timestamps: take max across ranks per phase per iteration
-    dist.all_reduce(phase_ts, op=dist.ReduceOp.MAX)
+    # Compute per-phase deltas per rank first (clock64 is per-GPU, not cross-GPU comparable)
     ts = phase_ts.cpu().numpy()  # (N, 8)
-
-    # Compute per-phase deltas (cycles)
-    # Phases 0-5 are sequential on notify warp, phase 6 is on dispatch warp (concurrent with 2-5)
-    # Phase 7 is after exit barrier
     deltas = np.zeros((N, NUM_PHASES - 1), dtype=np.int64)
     for p in range(5):
         deltas[:, p] = ts[:, p + 1] - ts[:, p]
-    # Phase 5->7: exit barrier + dispatch completion
     deltas[:, 5] = ts[:, 7] - ts[:, 5]
-    # Phase 6 (dispatch warp) measured as 6 - 1 (from after entry barrier to token loop done)
     deltas[:, 6] = ts[:, 6] - ts[:, 1]
+
+    # Now reduce deltas (max across ranks) — these are durations, not absolute timestamps
+    deltas_t = torch.tensor(deltas, dtype=torch.int64, device='cuda')
+    dist.all_reduce(deltas_t, op=dist.ReduceOp.MAX)
+    deltas = deltas_t.cpu().numpy()
 
     delta_names = [
         '0->1 entry_barrier',
