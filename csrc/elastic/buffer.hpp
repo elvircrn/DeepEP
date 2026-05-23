@@ -1290,12 +1290,15 @@ public:
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};
     }
-    torch::Tensor ping_pong(const int& peer_rank_idx, const int& num_iters, const int& num_sms, const int& num_experts) const {
+    torch::Tensor ping_pong(const int& peer_rank_idx, const int& num_iters, const int& num_sms,
+                            const int& num_experts, const int& num_payload_bytes = 0) const {
         auto timestamps = torch::zeros({num_iters, 2}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kLong));
         launch_ping_pong(
             nccl_context->dev_comm, nccl_context->window,
-            workspace, nccl_context->scaleup_rank_idx, peer_rank_idx,
+            workspace, buffer,
+            nccl_context->scaleup_rank_idx, peer_rank_idx,
             timestamps.data_ptr<int64_t>(), num_iters,
+            num_payload_bytes,
             nccl_context->num_scaleup_ranks, num_experts,
             nccl_context->is_scaleup_nvlink,
             num_sms, nccl_context->num_allocated_qps,

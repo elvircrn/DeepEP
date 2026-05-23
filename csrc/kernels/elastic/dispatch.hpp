@@ -506,6 +506,8 @@ public:
         int peer_rank_idx;
         int64_t* timestamps;
         int num_iters;
+        void* data_buffer;
+        int num_payload_bytes;
 
         jit::LaunchArgs launch_args;
     };
@@ -532,14 +534,17 @@ static void __instantiate_kernel() {{
             kernel, config,
             args.nccl_dev_comm, args.nccl_window,
             args.workspace, args.rank_idx,
-            args.peer_rank_idx, args.timestamps, args.num_iters));
+            args.peer_rank_idx, args.timestamps, args.num_iters,
+            args.data_buffer, args.num_payload_bytes));
     }
 };
 
 static void launch_ping_pong(
     const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
-    void* workspace, const int& rank_idx, const int& peer_rank_idx,
+    void* workspace, void* data_buffer,
+    const int& rank_idx, const int& peer_rank_idx,
     int64_t* timestamps, const int& num_iters,
+    const int& num_payload_bytes,
     const int& num_scaleup_ranks, const int& num_experts,
     const bool& is_scaleup_nvlink,
     const int& num_sms, const int& num_qps,
@@ -559,6 +564,8 @@ static void launch_ping_pong(
         .peer_rank_idx = peer_rank_idx,
         .timestamps = timestamps,
         .num_iters = num_iters,
+        .data_buffer = data_buffer,
+        .num_payload_bytes = num_payload_bytes,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 2 - (num_sms % 2), true)};
     const auto code = PingPongRuntime::generate(args);
     const auto runtime = jit::compiler->build("ping_pong", code);

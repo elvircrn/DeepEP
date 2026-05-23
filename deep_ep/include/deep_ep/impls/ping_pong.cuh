@@ -17,7 +17,9 @@ ping_pong_gin_impl(
     const int rank_idx,
     const int peer_rank_idx,
     int64_t* timestamps,
-    const int num_iters) {
+    const int num_iters,
+    void* data_buffer,
+    const int num_payload_bytes) {
 
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -48,22 +50,46 @@ ping_pong_gin_impl(
     if (peer_rank_idx < 0)
         return;
 
+    // Get symmetric pointer to peer's data buffer for bulk writes
+    auto* peer_data = gin.template get_sym_ptr<ncclTeamTagLsa>(
+        static_cast<int64_t*>(data_buffer), peer_rank_idx);
+    const int num_words = num_payload_bytes / 8;
+
     const bool is_pinger = (rank_idx < peer_rank_idx);
 
     for (int i = 0; i < num_iters; ++i) {
         const int64_t val = static_cast<int64_t>(i + 1);
 
         if (is_pinger) {
-            // Send to peer, wait for response
             timestamps[i * 2] = clock64();
-            gin.put_value<ncclTeamTagLsa>(&mailbox[peer_rank_idx], val, peer_rank_idx);
+
+            // Write payload to peer's data region
+            for (int j = 0; j < num_words; ++j)
+                ptx::st_relaxed_sys(peer_data + j, val);
+            if (num_words > 0)
+                __threadfence_system();
+
+            // Signal
+            gin.template put_value<ncclTeamTagLsa>(&mailbox[peer_rank_idx], val, peer_rank_idx);
+
+            // Wait for response
             while (ptx::ld_acquire_sys(&mailbox[rank_idx]) < val) {}
             timestamps[i * 2 + 1] = clock64();
         } else {
-            // Wait for peer, then respond
             timestamps[i * 2] = clock64();
+
+            // Wait for peer's signal
             while (ptx::ld_acquire_sys(&mailbox[rank_idx]) < val) {}
-            gin.put_value<ncclTeamTagLsa>(&mailbox[peer_rank_idx], val, peer_rank_idx);
+
+            // Write payload back
+            for (int j = 0; j < num_words; ++j)
+                ptx::st_relaxed_sys(peer_data + j, val);
+            if (num_words > 0)
+                __threadfence_system();
+
+            // Signal response
+            gin.template put_value<ncclTeamTagLsa>(&mailbox[peer_rank_idx], val, peer_rank_idx);
+
             timestamps[i * 2 + 1] = clock64();
         }
     }
