@@ -305,7 +305,7 @@ static void launch_dispatch(void* x, void* sf,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .phase_timestamps = phase_timestamps,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), false)};
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);

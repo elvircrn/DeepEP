@@ -224,7 +224,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
 
     // All the SMs should wait
     if constexpr (kSyncAtStart) {
-        cooperative_groups::this_grid().sync();
+        __syncthreads();
     } else {
         EP_STATIC_ASSERT(not kFlushStores, "No data to be flushed");
     }
@@ -242,7 +242,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
             // We need an extra grid sync, as the scaleout barrier will do a sync after flush, before the barrier
             // NOTES: this is kind of hacky
             if constexpr (kFlushStores) 
-                cooperative_groups::this_grid().sync();
+                __syncthreads();
         } else {
             // The remaining SMs do the scaleout barrier
             scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
@@ -260,7 +260,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
 
     // All the SMs should wait
     if constexpr (kSyncAtEnd)
-        cooperative_groups::this_grid().sync();
+        __syncthreads();
 }
 
 }  // namespace deep_ep::elastic::comm
