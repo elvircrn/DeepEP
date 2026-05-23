@@ -151,7 +151,15 @@ def main():
             do_expand=args.do_expand)
     torch.cuda.synchronize()
 
-    # Timed iterations with phase timestamps
+    # Get a cached handle (preallocates all tensors)
+    _, _, _, cached_handle, _ = ebuf.dispatch(
+        inp, topk_idx=topk_idx, topk_weights=topk_weights,
+        num_experts=E, num_max_tokens_per_rank=T,
+        num_sms=num_sms, async_with_compute_stream=True,
+        do_expand=args.do_expand)
+    torch.cuda.synchronize()
+
+    # Timed iterations with phase timestamps (using cached handle = zero allocations)
     phase_ts = torch.zeros((N, NUM_PHASES), dtype=torch.int64, device='cuda')
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
@@ -163,7 +171,7 @@ def main():
         torch.cuda.synchronize()
         start_events[i].record()
         _, _, _, _, ev = ebuf.dispatch(
-            inp, topk_idx=topk_idx, topk_weights=topk_weights,
+            inp, handle=cached_handle,
             num_experts=E, num_max_tokens_per_rank=T,
             num_sms=num_sms, async_with_compute_stream=True,
             do_expand=args.do_expand,
