@@ -1,7 +1,5 @@
-#include <nvshmem.h>
-#include <nvshmemx.h>
-
-#include <deep_ep/common/exception.cuh>
+#include "compiled.cuh"
+#include "ibgda_device.cuh"
 
 namespace deep_ep::legacy {
 
@@ -49,8 +47,8 @@ void launch_ping_pong_nvshmem(
         return;
 
     auto* sym_mailbox = static_cast<int64_t*>(rdma_buffer_ptr);
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(&sym_mailbox[rank], 0, sizeof(int64_t), stream));
-    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
+    cudaMemsetAsync(&sym_mailbox[rank], 0, sizeof(int64_t), stream);
+    cudaStreamSynchronize(stream);
 
     ping_pong_nvshmem_kernel<<<1, 1, 0, stream>>>(
         sym_mailbox, rank, peer_rank, timestamps, num_iters);
