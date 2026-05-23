@@ -248,10 +248,11 @@ static void launch_dispatch(void* x, void* sf,
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
 
     // Notify warps
-    // TODO: why don't we use 4 notify warps?
-    const int num_notify_warps = cached_mode ? 0 : kNumNotifyWarps;
+    // Force full notify warps when phase timestamps are requested (even in cached mode)
+    const bool skip_notify = cached_mode && (phase_timestamps == nullptr);
+    const int num_notify_warps = skip_notify ? 0 : kNumNotifyWarps;
     const bool reuse_slot_indices = cached_mode or deterministic;
-    const int num_notify_smem_bytes = cached_mode ? 0 : get_num_notify_smem_bytes(num_ranks, num_experts);
+    const int num_notify_smem_bytes = skip_notify ? 0 : get_num_notify_smem_bytes(num_ranks, num_experts);
     EP_HOST_ASSERT(num_notify_warps % 4 == 0);
 
     // Other warps
@@ -305,7 +306,7 @@ static void launch_dispatch(void* x, void* sf,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .phase_timestamps = phase_timestamps,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), false)};
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);

@@ -151,7 +151,7 @@ def main():
             do_expand=args.do_expand)
     torch.cuda.synchronize()
 
-    # Get a cached handle (preallocates all tensors)
+    # Get a cached handle (preallocates all tensors, zero per-iteration allocations)
     _, _, _, cached_handle, _ = ebuf.dispatch(
         inp, topk_idx=topk_idx, topk_weights=topk_weights,
         num_experts=E, num_max_tokens_per_rank=T,
@@ -159,7 +159,7 @@ def main():
         do_expand=args.do_expand)
     torch.cuda.synchronize()
 
-    # Timed iterations with phase timestamps (using cached handle = zero allocations)
+    # Timed iterations with phase timestamps (cached handle + forced notify warps)
     phase_ts = torch.zeros((N, NUM_PHASES), dtype=torch.int64, device='cuda')
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
