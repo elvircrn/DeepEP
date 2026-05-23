@@ -157,10 +157,9 @@ def main():
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
 
     for i in range(N):
-        torch.cuda.synchronize()
-        dist.barrier()
         flush_buf.zero_()
         torch.cuda.synchronize()
+        dist.barrier()
         start_events[i].record()
         _, _, _, _, ev = ebuf.dispatch(
             inp, topk_idx=topk_idx, topk_weights=topk_weights,
@@ -318,10 +317,9 @@ def main():
     legacy_end = [torch.cuda.Event(enable_timing=True) for _ in range(N)]
 
     for i in range(N):
-        torch.cuda.synchronize()
-        dist.barrier()
         flush_buf.zero_()
         torch.cuda.synchronize()
+        dist.barrier()
         legacy_start[i].record()
         legacy_buf.clean_low_latency_buffer(T, H, E)
         _, _, _, event_d, _ = legacy_buf.low_latency_dispatch(x, topk_idx, T, E, **legacy_dispatch_kwargs)
