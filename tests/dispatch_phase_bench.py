@@ -154,6 +154,7 @@ def main():
         torch.cuda.synchronize()
         dist.barrier()
         flush_buf.zero_()
+        torch.cuda.synchronize()
         start_events[i].record()
         _, _, _, _, ev = ebuf.dispatch(
             inp, topk_idx=topk_idx, topk_weights=topk_weights,
