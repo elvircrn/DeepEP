@@ -12,6 +12,7 @@ and prints a side-by-side comparison.
 """
 import argparse
 import os
+import random
 import sys
 
 os.environ.setdefault('NVSHMEM_QP_DEPTH', '4096')
@@ -199,7 +200,7 @@ def main():
             if rank == 0:
                 print(f'\n=== EP_REUSE_NCCL_COMM={reuse_mode} ===', flush=True)
 
-        # --- Allocate buffers ---
+        # --- Allocate legacy buffer (if needed) ---
 
         buffer = None
         if not args.skip_legacy:
@@ -209,19 +210,12 @@ def main():
                 num_qps_per_rank=E // num_ranks,
                 allow_mnnvl=not args.no_mnnvl, explicitly_destroy=True)
 
-        elastic_bufs = {}
-        elastic_bufs['bf16'] = deep_ep.ElasticBuffer(
-            group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-            use_fp8_dispatch=False, prefer_overlap_with_compute=False, explicitly_destroy=True)
-        elastic_bufs['fp8'] = deep_ep.ElasticBuffer(
-            group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-            use_fp8_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
-        elastic_bufs['nvfp4'] = deep_ep.ElasticBuffer(
-            group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
-            use_nvfp4_dispatch=True, prefer_overlap_with_compute=False, explicitly_destroy=True)
-
         if sm_counts is None:
-            theoretical_sms = elastic_bufs['bf16'].get_theoretical_num_sms(E, K)
+            tmp_ebuf = deep_ep.ElasticBuffer(
+                group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+                use_fp8_dispatch=False, prefer_overlap_with_compute=False, explicitly_destroy=True)
+            theoretical_sms = tmp_ebuf.get_theoretical_num_sms(E, K)
+            tmp_ebuf.destroy()
             if args.sm_counts:
                 sm_counts = sorted(args.sm_counts)
             else:
@@ -235,34 +229,41 @@ def main():
                 ]))
 
         # --- Run dispatch under each config ---
+        # One elastic buffer at a time to minimize memory usage.
 
-        for strategy in strategies:
-            topk_idx = build_topk(strategy, T, E, K, num_local_experts, local_start, rank)
+        for fmt in formats:
+            use_fp8 = (fmt == 'fp8')
+            use_nvfp4 = (fmt == 'nvfp4')
 
-            for fmt in formats:
-                use_fp8 = (fmt == 'fp8')
-                use_nvfp4 = (fmt == 'nvfp4')
+            dispatch_kwargs = dict(use_fp8=use_fp8, async_finish=True, return_recv_hook=False)
+            if use_nvfp4:
+                dispatch_kwargs['use_nvfp4'] = True
+                dispatch_kwargs['x_global_scale'] = x_global_scale
+                dispatch_kwargs['pack_scale_writes'] = args.pack_scale_writes
+            elif fmt == 'bf16':
+                dispatch_kwargs['use_fp8'] = False
 
-                dispatch_kwargs = dict(use_fp8=use_fp8, async_finish=True, return_recv_hook=False)
-                if use_nvfp4:
-                    dispatch_kwargs['use_nvfp4'] = True
-                    dispatch_kwargs['x_global_scale'] = x_global_scale
-                    dispatch_kwargs['pack_scale_writes'] = args.pack_scale_writes
-                elif fmt == 'bf16':
-                    dispatch_kwargs['use_fp8'] = False
+            if use_nvfp4:
+                elastic_inp = (x_nvfp4, x_nvfp4_sf)
+            elif use_fp8:
+                elastic_inp = (x_fp8, x_fp8_sf)
+            else:
+                elastic_inp = x
 
-                if use_nvfp4:
-                    elastic_inp = (x_nvfp4, x_nvfp4_sf)
-                elif use_fp8:
-                    elastic_inp = (x_fp8, x_fp8_sf)
-                else:
-                    elastic_inp = x
-                elastic_ebuf = elastic_bufs[fmt]
+            for strategy in strategies:
+                topk_idx = build_topk(strategy, T, E, K, num_local_experts, local_start, rank)
+
+                # Fresh buffer per (fmt, strategy) to reset dispatch counter
+                elastic_ebuf = deep_ep.ElasticBuffer(
+                    group, num_max_tokens_per_rank=T, hidden=H, num_topk=K,
+                    use_fp8_dispatch=(use_fp8 and not use_nvfp4),
+                    use_nvfp4_dispatch=use_nvfp4,
+                    prefer_overlap_with_compute=False, explicitly_destroy=True)
 
                 kernels = {}
 
-                # Legacy low-latency dispatch
-                if not args.skip_legacy:
+                # Legacy low-latency dispatch (only with first format to avoid duplicates)
+                if not args.skip_legacy and fmt == formats[0]:
                     def make_legacy(idx=topk_idx, kw=dispatch_kwargs):
                         def fn():
                             buffer.clean_low_latency_buffer(T, H, E)
@@ -271,7 +272,6 @@ def main():
                         return fn
                     kernels['legacy'] = make_legacy()
 
-                # Elastic dispatch (ablate num_sms x do_expand)
                 def make_elastic(idx=topk_idx, ebuf=elastic_ebuf,
                                  inp=elastic_inp, nsms=theoretical_sms,
                                  expand=False):
@@ -289,14 +289,18 @@ def main():
                         suffix = '+exp' if expand else ''
                         kernels[f'sm{nsms}{suffix}'] = make_elastic(nsms=nsms, expand=expand)
 
-                for kname, kfn in kernels.items():
+                kernel_items = list(kernels.items())
+                shuffle_seed = torch.randint(0, 2**31, (1,), device='cuda')
+                dist.broadcast(shuffle_seed, src=0)
+                rng = random.Random(shuffle_seed.item())
+                rng.shuffle(kernel_items)
+                for kname, kfn in kernel_items:
                     dist.barrier()
                     if args.batch_size > 1:
                         times = timed_batches(kfn, args.num_warmups, args.num_iters, args.batch_size)
                     else:
                         times = timed_iters(kfn, args.num_warmups, args.num_iters)
 
-                    # Reduce to worst-case rank per iteration
                     times_t = torch.tensor(times, dtype=torch.float64, device='cuda')
                     dist.all_reduce(times_t, op=dist.ReduceOp.MAX)
                     times_max = times_t.cpu().numpy()
@@ -311,12 +315,10 @@ def main():
 
                     dist.barrier()
 
-        # --- Destroy buffers before next reuse mode ---
+                elastic_ebuf.destroy()
 
         if buffer is not None:
             buffer.destroy()
-        for ebuf in elastic_bufs.values():
-            ebuf.destroy()
 
     # --- Report ---
 
