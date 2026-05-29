@@ -69,23 +69,23 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Barrier without TMA store flush, without prologue grid sync
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    // // Barrier without TMA store flush, without prologue grid sync
+    // comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+    //                   kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
+    //     gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
         // Assign shared memory
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
-        const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
+        const auto s_rank_expert_count = math::advance_ptr<int>(smem, 0);
 
         // Clean initial counts
         // NOTES: if you want to change the order of different warp roles, please take care of the `thread_idx`
-        int *rank_count = rank_expert_count, *expert_count = rank_expert_count + kNumRanks;
+        int *rank_count = s_rank_expert_count, *expert_count = s_rank_expert_count + kNumRanks;
         #pragma unroll
         for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
-            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
+            s_rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
         // Atomic add on shared memory
@@ -109,9 +109,16 @@ dispatch_impl(
         // Do full-grid reduction
         #pragma unroll
         for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
-            const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
+            const int64_t counter = (1ll << 32ll) | s_rank_expert_count[i];
             ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
         }
+
+		// So far this is local compute... the result is what?
+
+		// Result = workspace_layout.get_notify_reduction_workspace_ptr() ?
+
+		// Scaleup -> ?
+
 
         // Do the remaining work by SM 0
         if (sm_idx == 0) {
@@ -126,7 +133,7 @@ dispatch_impl(
                         // Write into send buffer if with RDMA
                         const auto encoded =
                             math::encode_decode_positive(static_cast<int>(status & 0xffffffffll));
-                        rank_expert_count[i] = encoded;
+                        s_rank_expert_count[i] = encoded;
                         if constexpr (not kIsScaleupNVLink)
                             workspace_layout.get_scaleup_rank_expert_count_ptr<true>()[i] = encoded;
 
@@ -155,6 +162,12 @@ dispatch_impl(
                 gin.put_value<team_t>(dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
                                       ncclGinOptFlagsAggregateRequests);
             }
+
+			// dst_rank_counter... is what?
+
+			// dst_rank_counter -> size equal to E * R
+
+			// dst_rank_counter = [R_0_0, R_1_0, R_2_0, ..., R_1_0, ...]
             __syncwarp();
 
             // Issue scaleup expert count writes to peers
@@ -189,7 +202,7 @@ dispatch_impl(
                     const auto decoded = math::encode_decode_positive(count);
                     if (math::is_decoded_positive_ready(decoded)) {
                         workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[i] = 0;
-                        rank_expert_count[i] = decoded;
+                        s_rank_expert_count[i] = decoded;
                         return true;
                     }
 
@@ -218,7 +231,7 @@ dispatch_impl(
             if constexpr (kDoCPUSync) {
                 for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumNotifyThreads) {
                     host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[i] =
-                        math::encode_decode_positive(rank_expert_count[i]);
+                        math::encode_decode_positive(s_rank_expert_count[i]);
                 }
                 __syncwarp();
             }

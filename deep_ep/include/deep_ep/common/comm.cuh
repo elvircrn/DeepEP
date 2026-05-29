@@ -34,6 +34,7 @@ __device__ __forceinline__ void timeout_while(const bool& condition, const func_
     if (start_clock == 0)
         start_clock = clock64();
 
+    // NOTE(elvircrn): Sometimes this is just threadIdx.x == 0
     while (condition) {
         const bool timeout = clock64() - start_clock >= kNumTimeoutCycles;
         if (func(timeout))
