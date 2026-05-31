@@ -12,6 +12,7 @@ namespace deep_ep::elastic {
 
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kSkipPrologueBarrier,
           int kNumSMs,
           int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -77,10 +78,12 @@ hybrid_dispatch_impl(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Global parallel barriers for scale-out subteam and scale-up subteam
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, false, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    if constexpr (not kSkipPrologueBarrier) {
+        // Global parallel barriers for scale-out subteam and scale-up subteam
+        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, false, true>(
+            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    }
 
     // The golden layout during the whole process for both scale-out and forward warps
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);

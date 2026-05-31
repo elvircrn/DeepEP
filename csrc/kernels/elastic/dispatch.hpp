@@ -94,6 +94,7 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        bool skip_prologue_barrier;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -127,10 +128,11 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.skip_prologue_barrier,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_dispatch_warps,
                 args.num_scaleup_ranks,
@@ -140,9 +142,10 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.skip_prologue_barrier,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
                 args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -235,6 +238,7 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& cached_mode,
                             const bool& deterministic,
                             const bool& do_cpu_sync,
+                            const bool& skip_prologue_barrier,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -278,6 +282,7 @@ static void launch_dispatch(void* x, void* sf,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .skip_prologue_barrier = skip_prologue_barrier,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,

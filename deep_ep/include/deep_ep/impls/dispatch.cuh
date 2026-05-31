@@ -17,6 +17,7 @@ namespace deep_ep::elastic {
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kSkipPrologueBarrier,
           int kNumSMs,
           int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks,
@@ -69,10 +70,12 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // // Barrier without TMA store flush, without prologue grid sync
-    // comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-    //                   kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
-    //     gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    if constexpr (not kSkipPrologueBarrier) {
+        // Barrier without TMA store flush, without prologue grid sync
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
