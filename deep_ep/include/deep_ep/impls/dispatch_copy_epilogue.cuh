@@ -8,17 +8,43 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+// Device-wide arrive-and-wait barrier. Safe without cooperative launch because
+// this kernel runs with `__launch_bounds__(kNumThreads, 1)` and a grid of
+// exactly `kNumSMs` blocks -> at most one block per SM, so every block is
+// co-resident and no block can be waiting on an unscheduled peer.
+// `counter` must be host-zeroed before launch; use a distinct counter per call.
+__device__ __forceinline__ void grid_arrive_and_wait(int* counter, int expected) {
+    __syncthreads();
+    __threadfence();
+    if (threadIdx.x == 0) {
+        atomicAdd(counter, 1);
+        while (atomicAdd(counter, 0) < expected) { /* spin */ }
+    }
+    __syncthreads();
+}
+
+template <bool kDoExpand, bool kCachedMode,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
           int kNumHiddenBytes, int kNumSFPacks,
           int kNumMaxTokensPerRank,
-          int kNumExperts, int kNumTopk, int kExpertAlignment,
+          int kNumExperts, int kNumTopk,
+          // Fused MoE-align (decode / non-expand only). When enabled, the
+          // epilogue additionally emits DeepGEMM/Triton grouped-GEMM metadata
+          // (sorted_token_ids / expert_ids / num_tokens_post_pad), folding away
+          // the separate globalize + moe_align_block_size + count_and_sort
+          // kernels. `kAlignM` is the per-expert padding divisibility (each
+          // expert region is padded up to a multiple of it), NOT the runtime
+          // GEMM tile: the GEMM is chosen by the runtime heuristic after
+          // dispatch. The chosen GEMM's tile M must divide / be compatible with
+          // kAlignM. 16 is a safe default granularity.
+          bool kFuseMoeAlign = false, int kAlignM = 16,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumThreads = kNumWarps * 32,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
-          bool kDoCreateLinkedList = (kNumScaleoutRanks > 1 and not kCachedMode)>
+          bool kDoCreateLinkedList = (kNumScaleoutRanks > 1 and not kCachedMode),
+          int kNumExpertsPerRank = kNumExperts / kNumRanks>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* psum_num_recv_tokens_per_scaleup_rank,
@@ -27,10 +53,16 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             topk_idx_t* recv_topk_idx, float* recv_topk_weights,
                             int* recv_src_metadata,
                             int* channel_linked_list,
-                            int* num_unaligned_recv_tokens_per_expert,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                            const int scaleout_rank_idx, const int scaleup_rank_idx,
+                            // Fused MoE-align outputs / scratch (unused unless kFuseMoeAlign)
+                            int* sorted_token_ids = nullptr,
+                            int* fused_expert_ids = nullptr,
+                            int* num_tokens_post_pad = nullptr,
+                            int* expert_count = nullptr,   // [kNumExpertsPerRank], host-zeroed
+                            int* grid_barrier = nullptr,   // [>=2] ints, host-zeroed
+                            int num_sorted_slots = 0) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -107,17 +139,19 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         EP_DEVICE_ASSERT(ptx::deduplicate(dst_expert_idx, lane_idx) or dst_expert_idx == -1);
         if (not kDoExpand and lane_idx < kNumTopk)
             recv_topk_idx[i * kNumTopk + lane_idx] = static_cast<topk_idx_t>(dst_expert_idx);
+        // Fused MoE-align Phase 1: tally per-(local)-expert recv counts. `e` is
+        // already local (0..kNumExpertsPerRank) or -1 here.
+        if constexpr (kFuseMoeAlign) {
+            if (lane_idx < kNumTopk and dst_expert_idx >= 0)
+                atomicAdd(expert_count + dst_expert_idx, 1);
+        }
         __syncwarp();
 
         // Calculate target indices in the tensor
-        constexpr int kMetadataStride = 2 + kNumTopk;
         int dst_tensor_idx = -1;
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
-        } else if (kDoExpand and kCachedMode and lane_idx < kNumTopk) {
-            // Cached expand mode: read pre-computed dst_tensor_idx from metadata
-            dst_tensor_idx = recv_src_metadata[i * kMetadataStride + 2 + lane_idx];
-        } else if (kDoExpand and not kCachedMode and dst_expert_idx >= 0) {
+        } else if (kDoExpand and dst_expert_idx >= 0) {
             dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
         }
         __syncwarp();
@@ -185,26 +219,25 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
         __syncwarp();
 
-        // Write source token index (skip in cached mode as metadata is reused)
+        // Write source token index
         // And:
         //   - Non-hybrid mode: the source scaleup peer rank index and master top-k lane index
         //   - Hybrid mode: the slot index and master top-k lane index
-        if constexpr (not kCachedMode) {
-            if (ptx::elect_one_sync()) {
-                recv_src_metadata[i * kMetadataStride + 0] = *tma_buffer.get_src_token_global_idx_ptr();
-                if constexpr (kNumScaleoutRanks == 1) {
-                    recv_src_metadata[i * kMetadataStride + 1] = current_rank_idx * kNumTopk + master_src_topk_idx;
-                } else {
-                    recv_src_metadata[i * kMetadataStride + 1] = (i - current_rank_start) * kNumTopk + master_src_topk_idx;
-                }
+        constexpr int kMetadataStride = 2 + kNumTopk;
+        if (ptx::elect_one_sync()) {
+            recv_src_metadata[i * kMetadataStride + 0] = *tma_buffer.get_src_token_global_idx_ptr();
+            if constexpr (kNumScaleoutRanks == 1) {
+                recv_src_metadata[i * kMetadataStride + 1] = current_rank_idx * kNumTopk + master_src_topk_idx;
+            } else {
+                recv_src_metadata[i * kMetadataStride + 1] = (i - current_rank_start) * kNumTopk + master_src_topk_idx;
             }
-            __syncwarp();
-
-            // Write reduction source indices
-            if (kDoExpand and lane_idx < kNumTopk)
-                recv_src_metadata[i * kMetadataStride + 2 + lane_idx] = dst_tensor_idx;
-            __syncwarp();
         }
+        __syncwarp();
+
+        // Write reduction source indices
+        if (kDoExpand and lane_idx < kNumTopk)
+            recv_src_metadata[i * kMetadataStride + 2 + lane_idx] = dst_tensor_idx;
+        __syncwarp();
     }
 
     // Maintain linked list's ending
@@ -228,96 +261,64 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
     }
 
-    // Zero padding: clear the alignment gaps between experts in the expanded output
-    if constexpr (kDoZeroPadding and kDoExpand) {
-        // Wait for last TMA store from main loop to complete
-        ptx::tma_store_wait();
-        __syncwarp();
+    // ============================================================
+    // Fused MoE-align (decode / non-expand). Emits grouped-GEMM metadata
+    // equivalent to vLLM's globalize + moe_align_block_size + count_and_sort:
+    //   - sorted_token_ids: flattened (token*kNumTopk + k) ids grouped by local
+    //     expert, each expert region padded up to kAlignM. Dead slots = sentinel
+    //     (num_recv*kNumTopk), which the GEMM masks via `offs_token < num_valid`.
+    //   - fused_expert_ids: local expert id per kAlignM block, -1 for dead blocks.
+    //   - num_tokens_post_pad: padded total.
+    // recv_topk_idx[j] already holds the local expert id (or -1) written in the
+    // copy loop above, so Phase 3 reads it back directly — no buffer re-walk.
+    // ============================================================
+    if constexpr (kFuseMoeAlign) {
+        static_assert(not kDoExpand, "Fused MoE-align is non-expand only");
+        const int n_flat = num_recv_tokens * kNumTopk;
+        const int sentinel = n_flat;
+        const int num_blocks = num_sorted_slots / kAlignM;
+        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+        const int stride = kNumSMs * blockDim.x;
 
-        // Zero out the TMA buffer's hidden region in smem
-        ptx::st_bulk<kNumHiddenBytes>(tma_buffer.get_hidden_ptr());
+        // Barrier 0: Phase 1 (recv_topk_idx + expert_count) done on all blocks.
+        grid_arrive_and_wait(grid_barrier + 0, kNumSMs);
 
-        // Read all expert unaligned counts in parallel
-        constexpr int kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32);
-        int num_experts_per_lane[kNumExpertsPerLane];
-        #pragma unroll
-        for (int i = 0; i < kNumExpertsPerLane; ++ i) {
-            const int expert_idx = i * 32 + lane_idx;
-            num_experts_per_lane[i] = expert_idx < kNumExpertsPerRank ?
-                num_unaligned_recv_tokens_per_expert[expert_idx] : 0;
+        // Phase 2a: sentinel-fill sorted_token_ids and clear expert_ids.
+        for (int t = tid; t < num_sorted_slots; t += stride)
+            sorted_token_ids[t] = sentinel;
+        for (int b = tid; b < num_blocks; b += stride)
+            fused_expert_ids[b] = -1;
+
+        // Barrier 1: fills visible before block 0 overwrites assigned blocks.
+        grid_arrive_and_wait(grid_barrier + 1, kNumSMs);
+
+        // Phase 2b: block 0 computes kAlignM-aligned exclusive prefix offsets,
+        // stamps expert_ids per assigned block, and num_tokens_post_pad; then
+        // overwrites expert_count[e] with the base offset (Phase 3 write cursor).
+        if (blockIdx.x == 0 and threadIdx.x == 0) {
+            int base = 0;
+            #pragma unroll 1
+            for (int e = 0; e < kNumExpertsPerRank; ++ e) {
+                const int cnt = expert_count[e];
+                const int aligned = ((cnt + kAlignM - 1) / kAlignM) * kAlignM;
+                const int start_block = base / kAlignM;
+                const int nb = aligned / kAlignM;
+                for (int b = 0; b < nb; ++ b)
+                    fused_expert_ids[start_block + b] = e;
+                expert_count[e] = base;   // cursor start for Phase 3
+                base += aligned;
+            }
+            *num_tokens_post_pad = base;
         }
 
-        // Single while loop over all padding tokens
-        int wave_idx = 0, wave_pad_psum = 0, wave_tensor_psum = 0, pad_idx = global_warp_idx;
-        while (true) {
-            // Jump into the right position
-            int dst_tensor_idx;
-            while (wave_idx < kNumExpertsPerLane) {
-                // Assign current wave expert token count
-                int wave_num_experts_per_lane;
-                #pragma unroll
-                for (int i = 0; i < kNumExpertsPerLane; ++ i)
-                    wave_num_experts_per_lane = i == wave_idx ? num_experts_per_lane[i] : wave_num_experts_per_lane;
-                int wave_num_pads_per_lane = 0;
-                if (wave_idx * 32 + lane_idx < kNumExpertsPerRank) {
-                    wave_num_pads_per_lane = kExpertAlignment - (wave_num_experts_per_lane % kExpertAlignment);
-                    wave_num_pads_per_lane = wave_num_pads_per_lane == kExpertAlignment ? 0 : wave_num_pads_per_lane;
-                }
-                int wave_num_pads = ptx::reduce_add(wave_num_pads_per_lane);
+        // Barrier 2: offsets/cursors visible to all blocks before scatter.
+        grid_arrive_and_wait(grid_barrier + 2, kNumSMs);
 
-                // Check whether hit the current wave
-                if (pad_idx < wave_pad_psum + wave_num_pads) {
-                    const int local_pad_idx = pad_idx - wave_pad_psum;
-                    const int pad_psum = ptx::warp_inclusive_sum(wave_num_pads_per_lane, lane_idx);
-                    const int owner_lane_idx = __ffs(__ballot_sync(0xffffffff, pad_psum > local_pad_idx)) - 1;
-                    dst_tensor_idx = wave_tensor_psum + ptx::exchange(
-                        ptx::warp_exclusive_sum(wave_num_experts_per_lane + wave_num_pads_per_lane, lane_idx) +
-                        wave_num_experts_per_lane + local_pad_idx - (pad_psum - wave_num_pads_per_lane),
-                        owner_lane_idx);
-                    break;
-                }
-
-                // Move to the next wave
-                wave_idx ++;
-                wave_pad_psum += wave_num_pads;
-                wave_tensor_psum += ptx::reduce_add(wave_num_experts_per_lane + wave_num_pads_per_lane);
-            }
-            if (wave_idx >= kNumExpertsPerLane)
-                break;
-
-            // Zero data via TMA store
-            if (ptx::elect_one_sync()) {
-                ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
-                                  tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-                ptx::tma_store_commit();
-            }
-            __syncwarp();
-
-            // Zero weights
-            if (recv_topk_weights != nullptr and ptx::elect_one_sync())
-                recv_topk_weights[dst_tensor_idx] = 0.0f;
-            __syncwarp();
-
-            // Zero SF
-            if constexpr (kNumSFPacks > 0) {
-                const auto recv_sf_token_stride_i64 = static_cast<int64_t>(recv_sf_token_stride);
-                const auto recv_sf_hidden_stride_i64 = static_cast<int64_t>(recv_sf_hidden_stride);
-                constexpr sf_pack_t zero_sf_pack = {0};
-                const auto gmem_dst = math::advance_ptr<sf_pack_t>(recv_sf,
-                    dst_tensor_idx * (recv_sf_token_stride_i64 * sizeof(sf_pack_t)));
-                constexpr auto kNumFullIters = kNumSFPacks / 32;
-                #pragma unroll
-                for (int k = 0; k < kNumFullIters; ++ k)
-                    gmem_dst[(k * 32 + lane_idx) * recv_sf_hidden_stride_i64] = zero_sf_pack;
-                if constexpr (kNumSFPacks % 32 != 0) {
-                    if (kNumFullIters * 32 + lane_idx < kNumSFPacks)
-                        gmem_dst[(kNumFullIters * 32 + lane_idx) * recv_sf_hidden_stride_i64] = zero_sf_pack;
-                }
-            }
-            __syncwarp();
-
-            // Try to fill the next one
-            pad_idx += kNumSMs * kNumWarps;
+        // Phase 3: scatter flattened (token,k) ids into their expert's region.
+        for (int j = tid; j < n_flat; j += stride) {
+            const int e = static_cast<int>(recv_topk_idx[j]);
+            if (e >= 0)
+                sorted_token_ids[atomicAdd(expert_count + e, 1)] = j;
         }
     }
 }
