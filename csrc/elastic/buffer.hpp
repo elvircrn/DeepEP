@@ -666,6 +666,9 @@ public:
                std::vector<int>,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               // Fused MoE-align metadata (nullopt unless fuse_moe_align)
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
@@ -687,7 +690,8 @@ public:
              const bool& async_with_compute_stream,
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
-             const bool& use_tma_aligned_col_major_sf) const {
+             const bool& use_tma_aligned_col_major_sf,
+             const bool& fuse_moe_align, const int& align_m) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1089,6 +1093,37 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
+        // Allocate fused MoE-align metadata / scratch (decode / non-expand only).
+        // The copy epilogue folds globalize + moe_align_block_size + count_and_sort
+        // into grouped-GEMM-ready metadata when `fuse_moe_align` is set.
+        auto sorted_token_ids = std::optional<torch::Tensor>();
+        auto fused_expert_ids = std::optional<torch::Tensor>();
+        auto num_tokens_post_pad = std::optional<torch::Tensor>();
+        int* sorted_token_ids_ptr = nullptr;
+        int* fused_expert_ids_ptr = nullptr;
+        int* num_tokens_post_pad_ptr = nullptr;
+        int* expert_count_ptr = nullptr;
+        int* grid_barrier_ptr = nullptr;
+        int num_sorted_slots = 0;
+        torch::Tensor expert_count, grid_barrier;
+        if (fuse_moe_align) {
+            EP_HOST_ASSERT(not do_expand and "Fused MoE-align is non-expand only");
+            EP_HOST_ASSERT(align_m > 0);
+            // Worst case: each expert region padded up to align_m. Multiple of align_m.
+            num_sorted_slots = math::align(num_recv_tokens * num_topk + num_local_experts * align_m, align_m);
+            const auto int_opts = torch::TensorOptions(torch::kCUDA).dtype(torch::kInt);
+            sorted_token_ids = torch::empty({num_sorted_slots}, int_opts);
+            fused_expert_ids = torch::empty({num_sorted_slots / align_m}, int_opts);
+            num_tokens_post_pad = torch::empty({1}, int_opts);
+            expert_count = torch::zeros({num_local_experts}, int_opts);  // host-zeroed
+            grid_barrier = torch::zeros({3}, int_opts);                  // host-zeroed
+            sorted_token_ids_ptr = sorted_token_ids->data_ptr<int>();
+            fused_expert_ids_ptr = fused_expert_ids->data_ptr<int>();
+            num_tokens_post_pad_ptr = num_tokens_post_pad->data_ptr<int>();
+            expert_count_ptr = expert_count.data_ptr<int>();
+            grid_barrier_ptr = grid_barrier.data_ptr<int>();
+        }
+
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
@@ -1108,6 +1143,10 @@ public:
                                       jit::device_runtime->get_num_smem_bytes(),
                                       num_channels,
                                       do_expand, cached_mode,
+                                      fuse_moe_align, align_m,
+                                      sorted_token_ids_ptr, fused_expert_ids_ptr,
+                                      num_tokens_post_pad_ptr, expert_count_ptr,
+                                      grid_barrier_ptr, num_sorted_slots,
                                       comm_stream);
 
         // Stream control
@@ -1122,7 +1161,8 @@ public:
              deterministic_rank_count_buffer,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list},
+             channel_linked_list,
+             sorted_token_ids, fused_expert_ids, num_tokens_post_pad},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
@@ -1136,6 +1176,9 @@ public:
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
                 channel_linked_list,
+                sorted_token_ids,
+                fused_expert_ids,
+                num_tokens_post_pad,
                 event};
     }
 

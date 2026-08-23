@@ -317,6 +317,9 @@ public:
         int num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        // Fused MoE-align (decode / non-expand only)
+        bool fuse_moe_align = false;
+        int align_m = 16;   // per-expert padding divisibility (compile-time)
 
         // Parameters
         void *buffer, *workspace;
@@ -329,6 +332,13 @@ public:
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
+        // Fused MoE-align outputs / scratch (nullptr / 0 unless fuse_moe_align)
+        int* sorted_token_ids = nullptr;
+        int* fused_expert_ids = nullptr;
+        int* num_tokens_post_pad = nullptr;
+        int* expert_count = nullptr;
+        int* grid_barrier = nullptr;
+        int num_sorted_slots = 0;
 
         jit::LaunchArgs launch_args;
     };
@@ -340,7 +350,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
                            args.do_expand, args.cached_mode,
@@ -348,7 +358,8 @@ static void __instantiate_kernel() {{
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+                           args.num_experts, args.num_topk,
+                           args.fuse_moe_align, args.align_m);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -361,7 +372,10 @@ static void __instantiate_kernel() {{
                                                  args.channel_linked_list,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                 args.sorted_token_ids, args.fused_expert_ids,
+                                                 args.num_tokens_post_pad, args.expert_count,
+                                                 args.grid_barrier, args.num_sorted_slots));
     }
 };
 
@@ -381,6 +395,10 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_sms, const int& num_smem_bytes,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
+                                          const bool& fuse_moe_align, const int& align_m,
+                                          int* sorted_token_ids, int* fused_expert_ids,
+                                          int* num_tokens_post_pad, int* expert_count,
+                                          int* grid_barrier, const int& num_sorted_slots,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -395,6 +413,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .fuse_moe_align = fuse_moe_align, .align_m = align_m,
         .buffer = buffer, .workspace = workspace,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
@@ -405,10 +424,168 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .sorted_token_ids = sorted_token_ids, .fused_expert_ids = fused_expert_ids,
+        .num_tokens_post_pad = num_tokens_post_pad, .expert_count = expert_count,
+        .grid_barrier = grid_barrier, .num_sorted_slots = num_sorted_slots,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);
     DispatchCopyEpilogueRuntime::launch(runtime, args, stream);
+}
+
+class BarrierTestRuntime final : public jit::LaunchRuntime<BarrierTestRuntime> {
+public:
+    struct Args {
+        bool is_scaleup_nvlink;
+        int num_scaleup_ranks;
+        int num_experts;
+        int num_qps;
+        int64_t num_timeout_cycles;
+
+        ncclDevComm_t nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int rank_idx;
+        int64_t* timestamps;
+        int num_iters;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        auto func_name = fmt::format("barrier_test_impl<{}, {}, {}, {}, {}, {}, {}>",
+            args.is_scaleup_nvlink,
+            args.launch_args.grid_dim.first,
+            args.launch_args.num_threads,
+            args.num_scaleup_ranks,
+            args.num_experts,
+            args.num_qps, args.num_timeout_cycles);
+        return fmt::format(R"(
+#include <deep_ep/impls/barrier_test.cuh>
+using namespace deep_ep::elastic;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{});
+}}
+)", func_name);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window,
+            args.workspace, args.rank_idx,
+            args.timestamps, args.num_iters));
+    }
+};
+
+static void launch_barrier_test(
+    const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+    void* workspace, const int& rank_idx,
+    int64_t* timestamps, const int& num_iters,
+    const int& num_scaleup_ranks, const int& num_experts,
+    const bool& is_scaleup_nvlink,
+    const int& num_sms, const int& num_qps,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const int num_threads = 128;
+    const BarrierTestRuntime::Args args = {
+        .is_scaleup_nvlink = is_scaleup_nvlink,
+        .num_scaleup_ranks = num_scaleup_ranks,
+        .num_experts = num_experts,
+        .num_qps = num_qps,
+        .num_timeout_cycles = num_timeout_cycles,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .rank_idx = rank_idx,
+        .timestamps = timestamps,
+        .num_iters = num_iters,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 2 - (num_sms % 2), true)};
+    const auto code = BarrierTestRuntime::generate(args);
+    const auto runtime = jit::compiler->build("barrier_test", code);
+    BarrierTestRuntime::launch(runtime, args, stream);
+}
+
+class PingPongRuntime final : public jit::LaunchRuntime<PingPongRuntime> {
+public:
+    struct Args {
+        bool is_scaleup_nvlink;
+        int num_scaleup_ranks;
+        int num_experts;
+        int num_qps;
+        int64_t num_timeout_cycles;
+
+        ncclDevComm_t nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int rank_idx;
+        int peer_rank_idx;
+        int64_t* timestamps;
+        int num_iters;
+        void* data_buffer;
+        int num_payload_bytes;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        auto func_name = fmt::format("ping_pong_gin_impl<{}, {}, {}, {}, {}, {}, {}>",
+            args.is_scaleup_nvlink,
+            args.launch_args.grid_dim.first,
+            args.launch_args.num_threads,
+            args.num_scaleup_ranks,
+            args.num_experts,
+            args.num_qps, args.num_timeout_cycles);
+        return fmt::format(R"(
+#include <deep_ep/impls/ping_pong.cuh>
+using namespace deep_ep::elastic;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{});
+}}
+)", func_name);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window,
+            args.workspace, args.rank_idx,
+            args.peer_rank_idx, args.timestamps, args.num_iters,
+            args.data_buffer, args.num_payload_bytes));
+    }
+};
+
+static void launch_ping_pong(
+    const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+    void* workspace, void* data_buffer,
+    const int& rank_idx, const int& peer_rank_idx,
+    int64_t* timestamps, const int& num_iters,
+    const int& num_payload_bytes,
+    const int& num_scaleup_ranks, const int& num_experts,
+    const bool& is_scaleup_nvlink,
+    const int& num_sms, const int& num_qps,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const int num_threads = 128;
+    const PingPongRuntime::Args args = {
+        .is_scaleup_nvlink = is_scaleup_nvlink,
+        .num_scaleup_ranks = num_scaleup_ranks,
+        .num_experts = num_experts,
+        .num_qps = num_qps,
+        .num_timeout_cycles = num_timeout_cycles,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .rank_idx = rank_idx,
+        .peer_rank_idx = peer_rank_idx,
+        .timestamps = timestamps,
+        .num_iters = num_iters,
+        .data_buffer = data_buffer,
+        .num_payload_bytes = num_payload_bytes,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 2 - (num_sms % 2), true)};
+    const auto code = PingPongRuntime::generate(args);
+    const auto runtime = jit::compiler->build("ping_pong", code);
+    PingPongRuntime::launch(runtime, args, stream);
 }
 
 }  // namespace deep_ep::elastic

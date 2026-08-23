@@ -86,6 +86,12 @@ class EPHandle:
         # Inferred value, may not accurate without CPU sync
         self.num_recv_tokens = recv_src_metadata.shape[0]
 
+        # Fused MoE-align metadata, populated by `dispatch(fuse_moe_align=True)`
+        # / `dispatch_moe_align`. `None` otherwise.
+        self.sorted_token_ids: Optional[torch.Tensor] = None
+        self.moe_align_expert_ids: Optional[torch.Tensor] = None
+        self.num_tokens_post_pad: Optional[torch.Tensor] = None
+
 
 class ElasticBuffer:
     """
@@ -722,7 +728,9 @@ class ElasticBuffer:
                  do_handle_copy: bool = True,
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
-                 use_tma_aligned_col_major_sf: bool = False) \
+                 use_tma_aligned_col_major_sf: bool = False,
+                 fuse_moe_align: bool = False,
+                 align_m: int = 16) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -806,6 +814,13 @@ class ElasticBuffer:
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
 
+        # Fused MoE-align is a decode-only (non-expand) fast path that folds the
+        # downstream globalize + moe_align_block_size + count_and_sort into the
+        # dispatch copy epilogue.
+        if fuse_moe_align:
+            assert not do_expand, 'Fused MoE-align requires do_expand=False'
+            assert align_m > 0, 'Fused MoE-align requires a positive align_m (padding divisibility)'
+
         # Do dispatch
         (recv_x, recv_sf,
          recv_topk_idx, recv_topk_weights,
@@ -817,6 +832,9 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
+         sorted_token_ids,
+         moe_align_expert_ids,
+         num_tokens_post_pad,
          event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
@@ -833,7 +851,8 @@ class ElasticBuffer:
                                         previous_event_before_epilogue,
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
-                                        use_tma_aligned_col_major_sf)
+                                        use_tma_aligned_col_major_sf,
+                                        fuse_moe_align, align_m)
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,
@@ -848,11 +867,58 @@ class ElasticBuffer:
                               token_metadata_at_forward,
                               channel_linked_list)
 
+        # Stash fused MoE-align metadata on the handle (None unless fuse_moe_align).
+        # sorted_token_ids : [num_sorted_slots], flattened (token*num_topk + k) ids
+        #                    grouped by local expert, padded to align_m; dead slots
+        #                    hold the sentinel num_recv*num_topk.
+        # moe_align_expert_ids : [num_sorted_slots // align_m], local expert id per
+        #                    block, -1 for dead blocks.
+        # num_tokens_post_pad : [1], padded total token count.
+        handle.sorted_token_ids = sorted_token_ids
+        handle.moe_align_expert_ids = moe_align_expert_ids
+        handle.num_tokens_post_pad = num_tokens_post_pad
+
         # Repack SF
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
 
         # Return
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+
+    def dispatch_moe_align(self,
+                           x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                           align_m: int = 16,
+                           handle: Optional[EPHandle] = None,
+                           **kwargs):
+        """
+        Decode-only convenience wrapper around :meth:`dispatch` that fuses the
+        grouped-GEMM metadata (globalize + moe_align_block_size + count_and_sort)
+        into the dispatch copy epilogue.
+
+        Forces ``do_expand=False`` and ``do_cpu_sync=False`` (cached / CUDA-graph
+        decode). Returns the usual dispatch outputs plus the ready-to-GEMM
+        metadata tuple ``(sorted_token_ids, expert_ids, num_tokens_post_pad)``.
+
+        Arguments:
+            x: dispatch input, same as :meth:`dispatch`.
+            align_m: per-expert padding divisibility (default 16). The chosen
+                grouped-GEMM's tile M must be compatible with this granularity.
+            handle: a cached `EPHandle` (decode reuses the layout; required for
+                the graph-safe no-CPU-sync path).
+            kwargs: forwarded to :meth:`dispatch`.
+
+        Returns:
+            recv_x, recv_topk_idx, recv_topk_weights, handle, event,
+            (sorted_token_ids, expert_ids, num_tokens_post_pad)
+        """
+        recv_x, recv_topk_idx, recv_topk_weights, handle, event = self.dispatch(
+            x, handle=handle,
+            do_expand=False, do_cpu_sync=False,
+            fuse_moe_align=True, align_m=align_m,
+            **kwargs)
+        meta = (handle.sorted_token_ids,
+                handle.moe_align_expert_ids,
+                handle.num_tokens_post_pad)
+        return recv_x, recv_topk_idx, recv_topk_weights, handle, event, meta
 
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) \
