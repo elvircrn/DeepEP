@@ -1284,6 +1284,23 @@ public:
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
         }
 
+        // Restore the additive-identity invariant the combine reduction relies on.
+        // The reduction sums buffer[slot] * weight over each token's top-k
+        // destination slots and assumes any slot not written this round is zero.
+        // Dispatch only writes [0, num_recv) of the comm buffer; its tail keeps the
+        // PREVIOUS step's bytes (the buffer is reused and never re-zeroed -- only
+        // `workspace` is, at construction). On NVLink-root ranks the hybrid-combine
+        // aggregation folds those stale tail slots into the sum, corrupting the
+        // root output (reproduced by --ab-identical: two identical runs diverge
+        // ~0.16 only on local-rank-0 of each node). Zero the comm buffer here so
+        // unwritten slots contribute 0. The kernel's gpu_barrier runs after this,
+        // so peers' cross-rank writes into [0, num_recv) still land correctly.
+        const auto num_combine_bytes = get_combine_buffer_size(
+            num_max_tokens_per_rank, hidden, num_topk,
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink, allow_multiple_reduction);
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(buffer, 0, num_combine_bytes, comm_stream));
+
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
         const auto reduce_buffer = launch_combine(
