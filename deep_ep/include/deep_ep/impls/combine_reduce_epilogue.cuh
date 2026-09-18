@@ -16,6 +16,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kHidden,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
+          bool kSmallTokenKernel = false,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks : kNumScaleoutRanks,
@@ -65,8 +66,6 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Store buffers
     const auto output_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, 0, false);
     const auto output_buffer = layout::BufferLayout<false>(output_token_layout, 1, num_combined_tokens, combined_x);
-    const auto tma_buffer = layout::BufferLayout<false>(output_token_layout, kNumWarps, 1, smem)
-        .get_rank_buffer(warp_idx).get_token_buffer(0);
 
     // Bias layout
     const auto bias_0_buffer = layout::BufferLayout<false>(output_token_layout, 1, num_combined_tokens, bias_0);
@@ -129,6 +128,59 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
             __syncwarp();
         }
     };
+
+    if constexpr (kSmallTokenKernel) {
+        // One warp/CTA computes one hidden stage of one token.  The stage
+        // output is disjoint from every other CTA's output.
+        const int task_idx = static_cast<int>(blockIdx.x);
+        const int token_idx = task_idx / kNumHiddenStages;
+        if (token_idx >= num_combined_tokens)
+            return;
+
+        const int hidden_stage_idx = task_idx % kNumHiddenStages;
+        const int hidden_byte_offset =
+            hidden_stage_idx * kHiddenVecPerWarp * sizeof(combine_vec_t);
+        constexpr int kStageBytes = kHiddenVecPerWarp * sizeof(combine_vec_t);
+        const auto stage_layout = layout::TokenLayout(kStageBytes, 0, 0, false);
+        const auto stage_buffer = layout::BufferLayout<false>(stage_layout, 1, 1, smem);
+        auto tma_dst = static_cast<combine_vec_t*>(stage_buffer.get_base_ptr());
+
+        int stored_dst_rank_idx = -1;
+        int topk_slot_idx[kNumTokensInLayout];
+        prepare_topk(token_idx, topk_slot_idx, stored_dst_rank_idx);
+        combine_reduce<kHiddenVecPerWarp, kUnrollFactor, kNumTokensInLayout>(
+            lane_idx, topk_slot_idx, tma_dst,
+            /* Get source base */ [=](const int& slot_idx) {
+                return math::advance_ptr<combine_vec_t>(
+                    static_cast<combine_vec_t*>(comm_buffer.get_rank_buffer(slot_idx)
+                        .get_token_buffer(token_idx).get_base_ptr()), hidden_byte_offset);
+            },
+            /* Wait buffer release */ [=]() {
+                ptx::tma_store_wait();
+                __syncwarp();
+            },
+            /* Bias 0 */ bias_0 == nullptr ? nullptr : math::advance_ptr<combine_vec_t>(
+                bias_0_buffer.get_token_buffer(token_idx).get_base_ptr(), hidden_byte_offset),
+            /* Bias 1 */ bias_1 == nullptr ? nullptr : math::advance_ptr<combine_vec_t>(
+                bias_1_buffer.get_token_buffer(token_idx).get_base_ptr(), hidden_byte_offset)
+        );
+        ptx::tma_store_fence();
+        __syncwarp();
+
+        if (ptx::elect_one_sync()) {
+            ptx::tma_store_1d(
+                static_cast<int8_t*>(output_buffer.get_token_buffer(token_idx).get_base_ptr()) +
+                    hidden_byte_offset,
+                tma_dst, kStageBytes);
+            ptx::tma_store_commit();
+        }
+        __syncwarp();
+
+        if (hidden_stage_idx == 0)
+            write_topk_weights(token_idx, stored_dst_rank_idx);
+    } else {
+        const auto tma_buffer = layout::BufferLayout<false>(output_token_layout, kNumWarps, 1, smem)
+            .get_rank_buffer(warp_idx).get_token_buffer(0);
 
     if (use_split_tokens) {
         // Consecutive global warps cooperate on one token.  The current
@@ -211,6 +263,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
 
             write_topk_weights(token_idx, stored_dst_rank_idx);
         }
+    }
     }
 }
 

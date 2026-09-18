@@ -70,6 +70,18 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
         (kNumValidTopk <= 2 or topk_slot_idx[2] < 0);
     EP_STATIC_ASSERT(kNumValidTopk > 0, "Invalid top-k");
 
+    // compute_topk_slots() packs valid entries at the front and writes -1
+    // only after the valid prefix. Do not run the predicated load and FP32
+    // accumulation for the padded suffix.
+    if (bias_0 == nullptr and bias_1 == nullptr and topk_slot_idx[0] < 0) {
+        #pragma unroll 1
+        for (int i = 0; i < kHiddenVec / (kUnrollFactor * 32); ++ i)
+            #pragma unroll
+            for (int j = 0; j < kUnrollFactor; ++ j)
+                dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] = vec_t{};
+        return;
+    }
+
     if (enable_hadd_bypass) {
         #pragma unroll 1
         for (int i = 0; i < kHiddenVec / (kUnrollFactor * 32); ++ i) {
@@ -131,8 +143,9 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
 
             #pragma unroll
             for (int k = 0; k < kNumValidTopk; ++ k) {
-                // We have a limitation on `k` to reduce the branch instruction count
-                if (k >= kNumExpectedTopk and topk_slot_idx[k] < 0)
+                // Valid slots are packed at the front, so the first negative
+                // slot terminates the reduction.
+                if (topk_slot_idx[k] < 0)
                     break;
 
                 // Read values

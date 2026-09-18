@@ -201,6 +201,7 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        bool small_token_kernel;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -222,7 +223,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -230,7 +231,8 @@ static void __instantiate_kernel() {{
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.hidden,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+                           args.num_experts, args.num_topk,
+                           args.small_token_kernel);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -264,18 +266,30 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
     auto launch_num_sms = num_sms;
     auto launch_num_smem_bytes = num_smem_bytes;
+    bool small_token_kernel = false;
 
     // Decode/low-concurrency combines otherwise reserve a full token buffer
     // for all 32 warps and launch one block per SM.  For Kimi K3 this means
     // 132 blocks, 1024 threads, and ~232 KB of shared memory for one token.
-    // The epilogue's small-token path only needs a handful of warps, so keep
-    // enough warps for the hidden-stage split while reducing both the grid
-    // and the per-block shared-memory reservation.
+    // The epilogue's small-token path gets a dedicated one-warp CTA per
+    // hidden stage.  This avoids launching 1024-thread CTAs with nearly all
+    // warps idle for decode-sized batches.
     constexpr int kSmallTokenThreshold = 8;
-    if (num_combined_tokens <= kSmallTokenThreshold) {
-        num_warps = std::min(num_warps, 8);
-        launch_num_sms = std::min(num_sms, std::max(1, num_combined_tokens * 8));
-        launch_num_smem_bytes = num_warps * token_layout.get_num_bytes<false>();
+    if (num_combined_tokens > 0 and num_combined_tokens <= kSmallTokenThreshold) {
+        // CombineVecTraits uses int4 on the SM90 path used by Kimi K3.
+        // Mirror get_max_unroll_factor<..., 4>() to derive the stage size.
+        constexpr int kWarpSize = 32;
+        constexpr int kVecBytes = sizeof(int4);
+        const int hidden_vec = hidden * sizeof(nv_bfloat16) / kVecBytes;
+        const int unroll = hidden_vec % (kWarpSize * 4) == 0 ? 4 :
+                           hidden_vec % (kWarpSize * 2) == 0 ? 2 : 1;
+        const int hidden_stages = hidden_vec / (unroll * kWarpSize);
+        const int stage_bytes = unroll * kWarpSize * kVecBytes;
+        EP_HOST_ASSERT(hidden_stages > 0 and stage_bytes > 0);
+        num_warps = 1;
+        launch_num_sms = num_combined_tokens * hidden_stages;
+        launch_num_smem_bytes = stage_bytes;
+        small_token_kernel = true;
     }
     const auto num_threads = num_warps * 32;
 
@@ -287,6 +301,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .small_token_kernel = small_token_kernel,
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,
