@@ -38,6 +38,24 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
     const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;   // NOTES: Here we prioritize distributing tasks to different SMs to ensure that the last wave is evenly concentrated on each SM.
 
+    using combine_vec_t = typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
+    constexpr int kHiddenVec = kHidden * sizeof(nv_bfloat16) / sizeof(combine_vec_t);
+    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+    constexpr int kHiddenVecPerWarp = kUnrollFactor * 32;
+    constexpr int kNumHiddenStages = kHiddenVec / kHiddenVecPerWarp;
+
+    // For a small number of output tokens, the original mapping assigns one
+    // token to one warp.  A Kimi K3 decode step can have one real token, so
+    // that leaves almost the entire 32-warp epilogue idle while one warp
+    // reduces the complete hidden vector.  Give one token one warp per
+    // hidden stage instead.  Each stage is written to a disjoint output
+    // slice, so the warps do not need to communicate with one another.
+    constexpr bool kCanSplitToken = kNumHiddenStages > 1 and kNumHiddenStages <= kNumWarps;
+    constexpr int kWarpsPerSplitToken = kCanSplitToken ? kNumHiddenStages : 1;
+    constexpr int kTotalWarps = kNumSMs * kNumWarps;
+    const bool use_split_tokens = kCanSplitToken and
+        num_combined_tokens * kWarpsPerSplitToken <= kTotalWarps;
+
     // Load buffers from scale-out or scale-up ranks
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
@@ -58,10 +76,11 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
-    // Read from buffers and do reduction
-    for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx += kNumWarps * kNumSMs) {
+    auto prepare_topk = [&](const int& token_idx, int (&topk_slot_idx)[kNumTokensInLayout],
+                            int& stored_dst_rank_idx) {
         // Preprocess all indices
-        int stored_dst_rank_idx = -1, stored_dst_expert_idx = -1;
+        stored_dst_rank_idx = -1;
+        int stored_dst_expert_idx = -1;
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
         if (lane_idx < kNumTopk) {
             stored_dst_expert_idx = static_cast<int>(combined_topk_idx[token_idx * kNumTopk + lane_idx]);
@@ -86,45 +105,15 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         auto reduce_valid_mask = should_deduplicate ?
             ptx::gather(ptx::deduplicate(deduplicate_key, lane_idx) and stored_dst_rank_idx >= 0) :
             ptx::gather(stored_dst_rank_idx >= 0);
-        int topk_slot_idx[kNumTokensInLayout];
         compute_topk_slots(
             topk_slot_idx, reduce_valid_mask,
             [=](const int& idx) {
                 return kUseRankLayout ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
             }
         );
+    };
 
-        // Iterate over per-hidden-chunk stage
-        using combine_vec_t = typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
-        constexpr int kHiddenVec = kHidden * sizeof(nv_bfloat16) / sizeof(combine_vec_t);
-        constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-        combine_reduce<kHiddenVec, kUnrollFactor, kNumTokensInLayout>(
-            lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
-            /* Get source base */ [=](const int& slot_idx) {
-                return static_cast<combine_vec_t*>(
-                    comm_buffer.get_rank_buffer(slot_idx).get_token_buffer(token_idx).get_base_ptr());
-            },
-            /* Wait buffer release */ [=]() {
-                ptx::tma_store_wait();
-                __syncwarp();
-            },
-            /* Bias 0 */ bias_0 == nullptr ?
-                nullptr : static_cast<combine_vec_t*>(bias_0_buffer.get_token_buffer(token_idx).get_base_ptr()),
-            /* Bias 1 */ bias_1 == nullptr ?
-                nullptr : static_cast<combine_vec_t*>(bias_1_buffer.get_token_buffer(token_idx).get_base_ptr())
-        );
-        ptx::tma_store_fence();
-        __syncwarp();
-
-        // Issue TMA copy
-        if (ptx::elect_one_sync()) {
-            ptx::tma_store_1d(output_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                              tma_buffer.get_base_ptr(), kNumHiddenBytes);
-            ptx::tma_store_commit();
-        }
-        __syncwarp();
-
-        // Write top-k weights
+    auto write_topk_weights = [&](const int& token_idx, const int& stored_dst_rank_idx) {
         if (combined_topk_weights != nullptr) {
             const auto master_lane_idx = ptx::get_master_lane_idx(ptx::match(stored_dst_rank_idx));
             if (lane_idx < kNumTopk) {
@@ -138,6 +127,89 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                 combined_topk_weights[token_idx * kNumTopk + lane_idx] = value;
             }
             __syncwarp();
+        }
+    };
+
+    if (use_split_tokens) {
+        // Consecutive global warps cooperate on one token.  The current
+        // global-warp ordering intentionally puts these warps on different
+        // SM blocks, which gives the small reduction more memory bandwidth.
+        const int token_idx = global_warp_idx / kWarpsPerSplitToken;
+        if (token_idx < num_combined_tokens) {
+            const int hidden_stage_idx = global_warp_idx % kWarpsPerSplitToken;
+            const int hidden_vec_offset = hidden_stage_idx * kHiddenVecPerWarp;
+            const int hidden_byte_offset = hidden_vec_offset * sizeof(combine_vec_t);
+            int stored_dst_rank_idx = -1;
+            int topk_slot_idx[kNumTokensInLayout];
+            prepare_topk(token_idx, topk_slot_idx, stored_dst_rank_idx);
+
+            auto tma_dst = math::advance_ptr<combine_vec_t>(
+                tma_buffer.get_base_ptr(), hidden_byte_offset);
+            combine_reduce<kHiddenVecPerWarp, kUnrollFactor, kNumTokensInLayout>(
+                lane_idx, topk_slot_idx, tma_dst,
+                /* Get source base */ [=](const int& slot_idx) {
+                    return math::advance_ptr<combine_vec_t>(
+                        static_cast<combine_vec_t*>(comm_buffer.get_rank_buffer(slot_idx)
+                            .get_token_buffer(token_idx).get_base_ptr()), hidden_byte_offset);
+                },
+                /* Wait buffer release */ [=]() {
+                    ptx::tma_store_wait();
+                    __syncwarp();
+                },
+                /* Bias 0 */ bias_0 == nullptr ? nullptr : math::advance_ptr<combine_vec_t>(
+                    bias_0_buffer.get_token_buffer(token_idx).get_base_ptr(), hidden_byte_offset),
+                /* Bias 1 */ bias_1 == nullptr ? nullptr : math::advance_ptr<combine_vec_t>(
+                    bias_1_buffer.get_token_buffer(token_idx).get_base_ptr(), hidden_byte_offset)
+            );
+            ptx::tma_store_fence();
+            __syncwarp();
+
+            if (ptx::elect_one_sync()) {
+                ptx::tma_store_1d(
+                    math::advance_ptr(output_buffer.get_token_buffer(token_idx).get_base_ptr(), hidden_byte_offset),
+                    tma_dst, kHiddenVecPerWarp * sizeof(combine_vec_t));
+                ptx::tma_store_commit();
+            }
+            __syncwarp();
+
+            // Only the first stage writes the token's top-k weights.
+            if (hidden_stage_idx == 0)
+                write_topk_weights(token_idx, stored_dst_rank_idx);
+        }
+    } else {
+        // Original one-warp-per-token path for sufficiently large batches.
+        for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx += kNumWarps * kNumSMs) {
+            int stored_dst_rank_idx = -1;
+            int topk_slot_idx[kNumTokensInLayout];
+            prepare_topk(token_idx, topk_slot_idx, stored_dst_rank_idx);
+
+            combine_reduce<kHiddenVec, kUnrollFactor, kNumTokensInLayout>(
+            lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+            /* Get source base */ [=](const int& slot_idx) {
+                return static_cast<combine_vec_t*>(
+                    comm_buffer.get_rank_buffer(slot_idx).get_token_buffer(token_idx).get_base_ptr());
+            },
+            /* Wait buffer release */ [=]() {
+                ptx::tma_store_wait();
+                __syncwarp();
+            },
+            /* Bias 0 */ bias_0 == nullptr ?
+                nullptr : static_cast<combine_vec_t*>(bias_0_buffer.get_token_buffer(token_idx).get_base_ptr()),
+            /* Bias 1 */ bias_1 == nullptr ?
+                nullptr : static_cast<combine_vec_t*>(bias_1_buffer.get_token_buffer(token_idx).get_base_ptr())
+            );
+            ptx::tma_store_fence();
+            __syncwarp();
+
+            // Issue TMA copy
+            if (ptx::elect_one_sync()) {
+                ptx::tma_store_1d(output_buffer.get_token_buffer(token_idx).get_base_ptr(),
+                                  tma_buffer.get_base_ptr(), kNumHiddenBytes);
+                ptx::tma_store_commit();
+            }
+            __syncwarp();
+
+            write_topk_weights(token_idx, stored_dst_rank_idx);
         }
     }
 }

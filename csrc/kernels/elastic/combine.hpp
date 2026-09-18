@@ -261,7 +261,22 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
-    const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    auto launch_num_sms = num_sms;
+    auto launch_num_smem_bytes = num_smem_bytes;
+
+    // Decode/low-concurrency combines otherwise reserve a full token buffer
+    // for all 32 warps and launch one block per SM.  For Kimi K3 this means
+    // 132 blocks, 1024 threads, and ~232 KB of shared memory for one token.
+    // The epilogue's small-token path only needs a handful of warps, so keep
+    // enough warps for the hidden-stage split while reducing both the grid
+    // and the per-block shared-memory reservation.
+    constexpr int kSmallTokenThreshold = 8;
+    if (num_combined_tokens <= kSmallTokenThreshold) {
+        num_warps = std::min(num_warps, 8);
+        launch_num_sms = std::min(num_sms, std::max(1, num_combined_tokens * 8));
+        launch_num_smem_bytes = num_warps * token_layout.get_num_bytes<false>();
+    }
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
@@ -279,7 +294,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
+        .launch_args = jit::LaunchArgs(launch_num_sms, num_threads, launch_num_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine_reduce_epilogue", code);
