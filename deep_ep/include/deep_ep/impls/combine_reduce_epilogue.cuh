@@ -143,7 +143,8 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         constexpr int kStageBytes = kHiddenVecPerWarp * sizeof(combine_vec_t);
         const auto stage_layout = layout::TokenLayout(kStageBytes, 0, 0, false);
         const auto stage_buffer = layout::BufferLayout<false>(stage_layout, 1, 1, smem);
-        auto tma_dst = static_cast<combine_vec_t*>(stage_buffer.get_base_ptr());
+        const auto stage_token = stage_buffer.get_rank_buffer(0).get_token_buffer(0);
+        auto tma_dst = static_cast<combine_vec_t*>(stage_token.get_base_ptr());
 
         int stored_dst_rank_idx = -1;
         int topk_slot_idx[kNumTokensInLayout];
