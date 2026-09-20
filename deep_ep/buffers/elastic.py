@@ -829,8 +829,9 @@ class ElasticBuffer:
                 previous_event: EventHandle = None,
                 previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
-                allocate_on_comm_stream: bool = False) \
-            -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+                allocate_on_comm_stream: bool = False,
+                skip_combine_epilogue: bool = False) \
+            -> Union[Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap], dict]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
         Supports both single-node and multi-node settings.
@@ -850,11 +851,16 @@ class ElasticBuffer:
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
+            skip_combine_epilogue: skip DeepEP's CUDA reduction epilogue and return the raw reduction buffer plus
+                the metadata needed by an external epilogue.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
             combined_topk_weights: the reduced top-k weights, with shape `[num_combined_tokens, num_topk]` and type `torch.float`.
             event: the event after executing the kernel (valid only if `async_with_compute_stream` is set).
+
+            When `skip_combine_epilogue=True`, the return value is a dictionary containing the raw reduction
+            buffer and the metadata needed by an external epilogue.
         """
         check_torch_deterministic()
 
@@ -879,5 +885,32 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
-        return combined_x, combined_topk_weights, EventOverlap(event)
+                                 handle.do_expand,
+                                 skip_combine_epilogue)
+        event_overlap = EventOverlap(event)
+        if not skip_combine_epilogue:
+            return combined_x, combined_topk_weights, event_overlap
+
+        return {
+            'reduce_buffer': combined_x,
+            'reduce_buffer_bytes': int(combined_x.numel()),
+            'comm_stream': self.runtime.get_comm_stream(),
+            'combined_topk_idx': handle.topk_idx,
+            'num_combined_tokens': int(handle.topk_idx.shape[0]),
+            'num_max_tokens_per_rank': handle.num_max_tokens_per_rank,
+            'hidden': int(x.shape[1]),
+            'num_topk': int(handle.topk_idx.shape[1]),
+            'num_experts': handle.num_experts,
+            'num_sms': num_sms,
+            'num_qps': num_qps,
+            'num_scaleout_ranks': self.num_scaleout_ranks,
+            'num_scaleup_ranks': self.num_scaleup_ranks,
+            'scaleout_rank_idx': self.scaleout_rank_idx,
+            'scaleup_rank_idx': self.scaleup_rank_idx,
+            'use_expanded_layout': handle.do_expand,
+            'allow_multiple_reduction': self.allow_multiple_reduction,
+            'topk_weights': topk_weights,
+            'bias_0': bias_0,
+            'bias_1': bias_1,
+            'event': event_overlap,
+        }

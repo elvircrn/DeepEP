@@ -268,24 +268,28 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     auto launch_num_smem_bytes = num_smem_bytes;
     bool small_token_kernel = false;
 
+    // CombineVecTraits uses int4 on the SM90 path used by Kimi K3.  Mirror
+    // get_max_unroll_factor<..., 4>() to derive the amount of hidden state
+    // handled by one low-batch warp.
+    constexpr int kWarpSize = 32;
+    constexpr int kVecBytes = sizeof(int4);
+    const int hidden_vec = hidden * sizeof(nv_bfloat16) / kVecBytes;
+    const int unroll = hidden_vec % (kWarpSize * 4) == 0 ? 4 :
+                       hidden_vec % (kWarpSize * 2) == 0 ? 2 : 1;
+    const int hidden_stages = hidden_vec / (unroll * kWarpSize);
+    const int stage_bytes = unroll * kWarpSize * kVecBytes;
+    EP_HOST_ASSERT(hidden_stages > 0 and stage_bytes > 0);
+
     // Decode/low-concurrency combines otherwise reserve a full token buffer
     // for all 32 warps and launch one block per SM.  For Kimi K3 this means
     // 132 blocks, 1024 threads, and ~232 KB of shared memory for one token.
     // The epilogue's small-token path gets a dedicated one-warp CTA per
-    // hidden stage.  This avoids launching 1024-thread CTAs with nearly all
-    // warps idle for decode-sized batches.
-    constexpr int kSmallTokenThreshold = 8;
-    if (num_combined_tokens > 0 and num_combined_tokens <= kSmallTokenThreshold) {
-        // CombineVecTraits uses int4 on the SM90 path used by Kimi K3.
-        // Mirror get_max_unroll_factor<..., 4>() to derive the stage size.
-        constexpr int kWarpSize = 32;
-        constexpr int kVecBytes = sizeof(int4);
-        const int hidden_vec = hidden * sizeof(nv_bfloat16) / kVecBytes;
-        const int unroll = hidden_vec % (kWarpSize * 4) == 0 ? 4 :
-                           hidden_vec % (kWarpSize * 2) == 0 ? 2 : 1;
-        const int hidden_stages = hidden_vec / (unroll * kWarpSize);
-        const int stage_bytes = unroll * kWarpSize * kVecBytes;
-        EP_HOST_ASSERT(hidden_stages > 0 and stage_bytes > 0);
+    // hidden stage.  Use it while all of those CTAs fit in one wave of the
+    // physical SMs; beyond that point retain the original mapping to avoid
+    // turning a large combine into a long stream of tiny CTAs.
+    if (num_combined_tokens > 0 and hidden_stages > 1 and
+        hidden_stages <= 32 and
+        num_combined_tokens <= num_sms / hidden_stages) {
         num_warps = 1;
         launch_num_sms = num_combined_tokens * hidden_stages;
         launch_num_smem_bytes = stage_bytes;

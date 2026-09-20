@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include <pybind11/functional.h>
@@ -1124,7 +1125,8 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const bool& skip_combine_epilogue = false) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1230,6 +1232,37 @@ public:
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
             comm_stream);
+
+        // Expose the post-combine buffer for an external epilogue, for
+        // example a specialized Triton reduction.  The tensor is a
+        // non-owning view: its storage belongs to this ElasticBuffer and is
+        // kept alive by the buffer object.  Its stream ownership is still
+        // recorded below with stream_control_epilogue().
+        if (skip_combine_epilogue) {
+            const auto buffer_begin = reinterpret_cast<uintptr_t>(buffer);
+            const auto reduce_buffer_begin = reinterpret_cast<uintptr_t>(reduce_buffer);
+            EP_HOST_ASSERT(reduce_buffer_begin >= buffer_begin and
+                           reduce_buffer_begin <= buffer_begin + num_buffer_bytes);
+            const auto reduce_buffer_bytes = num_buffer_bytes -
+                static_cast<int64_t>(reduce_buffer_begin - buffer_begin);
+            auto reduce_buffer_tensor = torch::from_blob(
+                reduce_buffer, {reduce_buffer_bytes},
+                x.options().dtype(torch::kUInt8));
+
+            // Keep the same dependency ordering as the built-in epilogue.
+            stream_control_before_epilogue(previous_event_before_epilogue);
+            const auto event = stream_control_epilogue(
+                {x, topk_weights, bias_0, bias_1,
+                 src_metadata,
+                 combined_topk_idx,
+                 reduce_buffer_tensor,
+                 psum_num_recv_tokens_per_scaleup_rank,
+                 token_metadata_at_forward,
+                 channel_linked_list},
+                compute_stream,
+                allocate_on_comm_stream, async_with_compute_stream);
+            return {reduce_buffer_tensor, std::nullopt, event};
+        }
 
         // Allocate output tensors
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
