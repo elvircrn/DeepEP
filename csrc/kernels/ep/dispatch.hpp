@@ -173,6 +173,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
                                           int* num_unaligned_recv_tokens_per_expert,
+                                          int* recv_expert_ids,
                                           const int& num_recv_tokens, const int& num_max_tokens_per_rank,
                                           const int& num_hidden_bytes,
                                           const int& num_sf_packs, const int& recv_sf_token_stride, const int& recv_sf_hidden_stride,
@@ -182,7 +183,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_sms, const int& num_smem_bytes,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
-                                          const bool& do_zero_padding,
+                                          const bool& do_zero_padding, const bool& emit_expert_ids,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -194,9 +195,9 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 #include <deep_ep/impls/ep/dispatch_copy_epilogue.cuh>
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", do_expand, cached_mode, do_zero_padding,
+)", do_expand, cached_mode, do_zero_padding, emit_expert_ids,
         num_sms, num_channels, num_warps,
         num_scaleout_ranks, num_scaleup_ranks,
         num_hidden_bytes, num_sf_packs,
@@ -221,7 +222,8 @@ static void __instantiate_kernel() {{
         num_unaligned_recv_tokens_per_expert,
         num_recv_tokens,
         recv_sf_token_stride, recv_sf_hidden_stride,
-        scaleout_rank_idx, scaleup_rank_idx
+        scaleout_rank_idx, scaleup_rank_idx,
+        recv_expert_ids
     );
 }
 

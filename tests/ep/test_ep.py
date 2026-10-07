@@ -161,6 +161,12 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
             launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, args.defer_epilogue, expanded_dispatch_args)
         expanded_recv_x_bf16 = get_recv_x_bf16(expanded_recv_x)
 
+        # Expanding mode with expert ID emission (non-cached only)
+        emit_dispatch_args = dispatch_args | dict(do_expand=True, emit_expert_ids=True)
+        emit_recv_x, emit_recv_topk_idx, emit_recv_topk_weights, emit_handle, emit_dispatch_event = \
+            launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, args.defer_epilogue, emit_dispatch_args)
+        emit_recv_x_bf16 = get_recv_x_bf16(emit_recv_x)
+
         # Cached mode
         cached_dispatch_args = dict(
             x=x,
@@ -420,6 +426,45 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
             assert expanded_handle.recv_src_metadata.size(0) == num_recv_tokens
             expanded_safe_indices = expanded_indices.clone()
             expanded_safe_indices[~expanded_mask] = 0
+
+            # Emitted expert ID checks: `recv_expert_ids` must be the grouped-layout
+            # row->expert mapping materialized by the copy epilogue. Reconstruct it
+            # from the prefix sums the way vLLM's prototype does (searchsorted over
+            # aligned segment ends, real rows bounded by the raw prefix) and require
+            # an exact match, including `-1` on alignment padding and the unused
+            # worst-case tail.
+            assert emit_handle.recv_expert_ids is not None
+            assert emit_handle.recv_expert_ids.dtype == torch.int
+            assert emit_handle.recv_expert_ids.shape[0] == emit_recv_x_bf16.shape[0]
+            psum = emit_handle.psum_num_recv_tokens_per_expert
+            aligned_ends = align(psum, expert_alignment)
+            rows = torch.arange(emit_handle.recv_expert_ids.shape[0], device='cuda', dtype=psum.dtype)
+            seg = torch.searchsorted(aligned_ends, rows, right=True)
+            real = (seg < num_local_experts) & (rows < psum[seg.clamp_max(num_local_experts - 1)])
+            expected_ids = torch.where(real, seg, -1).to(torch.int)
+            assert torch.equal(emit_handle.recv_expert_ids, expected_ids), \
+                f'{emit_handle.recv_expert_ids[:32]}, {expected_ids[:32]}'
+            # Cross-check against the metadata slots: every valid expanded slot
+            # must lie inside its expert's real (unaligned) region, so the
+            # emitted ID at that row equals the segment owner from the search.
+            valid_slots = emit_handle.recv_src_metadata[:num_recv_tokens, 2:]
+            valid_slots_mask = valid_slots >= 0
+            slot_rows = valid_slots[valid_slots_mask].long()
+            slot_ids = emit_handle.recv_expert_ids[slot_rows]
+            assert (slot_ids >= 0).all()
+            slot_expected = torch.searchsorted(
+                aligned_ends, slot_rows.to(psum.dtype), right=True).to(torch.int)
+            assert torch.equal(slot_ids, slot_expected)
+            # Every row the metadata does not point at is padding or tail: `-1`
+            row_hit = torch.zeros(emit_handle.recv_expert_ids.shape[0], dtype=torch.bool, device='cuda')
+            row_hit[slot_rows] = True
+            assert (emit_handle.recv_expert_ids[~row_hit] == -1).all()
+            # Data must be identical to plain expand mode on the valid slots
+            assert torch.equal(expanded_recv_x_bf16[valid_expanded_indices],
+                               emit_recv_x_bf16[valid_expanded_indices])
+            # Emission must not perturb the plain expanded results
+            assert torch.equal(expanded_recv_topk_weights[valid_expanded_indices],
+                               emit_recv_topk_weights[valid_expanded_indices])
 
             # Cached expand checks: compare valid token slots and verify padding is zeroed
             cached_expanded_recv_x_bf16 = get_recv_x_bf16(cached_expanded_recv_x)

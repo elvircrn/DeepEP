@@ -306,6 +306,7 @@ public:
              const bool& allocate_on_comm_stream,
              const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
+             const bool& emit_expert_ids,
              const bool& use_tma_aligned_col_major_sf,
              const bool& defer_epilogue) const {
         // Check SM count
@@ -315,6 +316,13 @@ public:
 
         // Zero padding only makes sense with expand mode
         EP_HOST_ASSERT(not do_zero_padding or do_expand);
+
+        // Expert ID emission is an expand-mode byproduct: the copy epilogue
+        // assigns each row its slot via the per-expert atomic counter, so the
+        // row's expert ID is known there and can be stored alongside the data.
+        // Cached mode reuses precomputed slots and never recomputes expert IDs.
+        EP_HOST_ASSERT(not emit_expert_ids or
+                       (do_expand and not cached_num_recv_tokens.has_value()));
 
         // Cached mode must have responding handles
         const bool cached_mode = cached_num_recv_tokens.has_value();
@@ -708,6 +716,20 @@ public:
                 recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
             }
 
+            // Per-row local expert IDs for the expanded layout, `-1` on
+            // padding and unused tail capacity. Pre-filled so the copy
+            // epilogue only needs to write real rows; without CPU sync the
+            // allocation is worst-case, and the untouched entries mark the
+            // unused region. Guaranteed `-1` on every non-real row is the
+            // contract grouped-GEMM consumers mask on.
+            auto recv_expert_ids = std::optional<torch::Tensor>();
+            int* recv_expert_ids_ptr = nullptr;
+            if (emit_expert_ids) {
+                recv_expert_ids = torch::full({num_allocated_tokens}, -1,
+                                              torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+                recv_expert_ids_ptr = recv_expert_ids->data_ptr<int>();
+            }
+
             // Process prefix sum, in expanding mode, it is also atomic counters
             if (not cached_mode) {
                 if (do_expand) {
@@ -739,7 +761,7 @@ public:
                                           jit->device.get_num_smem_bytes(),
                                           num_channels,
                                           do_expand, cached_mode,
-                                          do_zero_padding,
+                                          do_zero_padding, emit_expert_ids,
                                           stream);
 
             auto result = pybind11::make_tuple(
@@ -753,7 +775,8 @@ public:
                 recv_src_metadata,
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
-                channel_linked_list);
+                channel_linked_list,
+                recv_expert_ids);
 
             // For non-deferring tensor recording
             if (tensors_to_record_opt.has_value()) {
@@ -763,6 +786,7 @@ public:
                 tensors.push_back(recv_topk_idx);
                 tensors.push_back(recv_topk_weights);
                 tensors.push_back(recv_src_metadata);
+                tensors.push_back(recv_expert_ids);
             }
             return result;
         };

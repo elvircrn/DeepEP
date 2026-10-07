@@ -54,6 +54,15 @@ class EPHandle:
         num_recv_tokens_per_expert_list: Python list of per-expert received token counts (CPU-side).
         num_unaligned_recv_tokens_per_expert: the actual (unaligned) number of tokens received per local
             expert, shape `[num_local_experts]` with `torch.int`. Only populated in expand mode.
+        recv_expert_ids: per-row local expert IDs for the expanded layout, shape `[num_expanded_tokens]`
+            with `torch.int` — the grouped-GEMM `m_indices` materialized by the dispatch copy epilogue.
+            Entry `r` is the local expert owning received row `r`; alignment padding within an expert's
+            segment and unused tail capacity hold `-1`. Only populated when `do_expand=True` and
+            dispatch was called with `emit_expert_ids=True` (which also requires a non-cached dispatch).
+            Rows are grouped by expert and each segment starts at the aligned prefix:
+            `align(psum_num_recv_tokens_per_expert[e-1], expert_alignment)`; this array is therefore
+            fully determined by the prefix sums — it is emitted as a byproduct (one store per row inside
+            the copy epilogue) so consumers never need to reconstruct it with a search or sort.
         recv_src_metadata: source token indices and buffer slot indices.
         dst_buffer_slot_idx: destination buffer slot indices from dispatch.
         token_metadata_at_forward: per-channel forwarded token metadata (hybrid mode only).
@@ -76,7 +85,8 @@ class EPHandle:
                  recv_src_metadata: torch.Tensor,
                  dst_buffer_slot_idx: torch.Tensor,
                  token_metadata_at_forward: Optional[torch.Tensor],
-                 channel_linked_list: Optional[torch.Tensor]):
+                 channel_linked_list: Optional[torch.Tensor],
+                 recv_expert_ids: Optional[torch.Tensor] = None):
         assert topk_idx is not None
 
         self.do_expand = do_expand
@@ -92,6 +102,7 @@ class EPHandle:
         self.dst_buffer_slot_idx = dst_buffer_slot_idx
         self.token_metadata_at_forward = token_metadata_at_forward
         self.channel_linked_list = channel_linked_list
+        self.recv_expert_ids = recv_expert_ids
 
         # May not be accurate without CPU sync
         self.num_recv_tokens = num_recv_tokens
@@ -576,6 +587,7 @@ class EPBuffer(BufferBase):
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
                  do_zero_padding: bool = False,
+                 emit_expert_ids: bool = False,
                  use_tma_aligned_col_major_sf: bool = False,
                  defer_epilogue: bool = False) \
             -> Union[Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -619,6 +631,12 @@ class EPBuffer(BufferBase):
             do_expand: whether to use the expanding layout (one slot per expert per token).
             do_zero_padding: whether to zero out the alignment padding slots in the expanded output.
                 Only valid when `do_expand` is True. Ensures alignment gaps between experts are zeroed.
+            emit_expert_ids: whether to emit per-row local expert IDs for the expanded layout
+                (`handle.recv_expert_ids`, one int per received row, `-1` on padding and unused
+                capacity). Only valid with `do_expand=True` and a non-cached dispatch. The copy
+                epilogue assigns each expanded row its slot via the per-expert atomic counter, so
+                the ID is known there and stored as a byproduct — grouped-GEMM consumers use this
+                directly as `m_indices` instead of reconstructing it from the prefix sums.
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
             defer_epilogue: whether to defer the CPU receive-count wait and copy epilogue until
                 `event.current_stream_wait()` is called. This requires `async_with_compute_stream=True`.
@@ -694,7 +712,7 @@ class EPBuffer(BufferBase):
                                                                  previous_event,
                                                                  async_with_compute_stream, allocate_on_comm_stream,
                                                                  do_cpu_sync, do_expand,
-                                                                 do_zero_padding,
+                                                                 do_zero_padding, emit_expert_ids,
                                                                  use_tma_aligned_col_major_sf,
                                                                  defer_epilogue)
         event_overlap = EventOverlap(event)
@@ -710,7 +728,8 @@ class EPBuffer(BufferBase):
              recv_src_metadata,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list) = dispatch_result
+             channel_linked_list,
+             recv_expert_ids) = dispatch_result
 
             # Create handle if not cached
             nonlocal handle
@@ -728,7 +747,8 @@ class EPBuffer(BufferBase):
                               recv_src_metadata,
                               dst_buffer_slot_idx,
                               token_metadata_at_forward,
-                              channel_linked_list) if handle is None else handle
+                              channel_linked_list,
+                              recv_expert_ids) if handle is None else handle
 
             # Do deterministic
             if self.deterministic:

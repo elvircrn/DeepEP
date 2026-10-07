@@ -9,7 +9,7 @@
 
 namespace deep_ep::ep {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kEmitExpertIds,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -31,7 +31,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* num_unaligned_recv_tokens_per_expert,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                            const int scaleout_rank_idx, const int scaleup_rank_idx,
+                            int* recv_expert_ids = nullptr) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -183,6 +184,25 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         } else if (not kDoExpand and recv_topk_weights != nullptr and lane_idx < kNumTopk) {
             // For backward, weights are optional
             recv_topk_weights[i * kNumTopk + lane_idx] = tma_buffer.get_topk_weights_ptr()[lane_idx];
+        }
+        __syncwarp();
+
+        // Store the per-row local expert ID (expand mode only).
+        // The slot assignment above already grouped rows by expert, so this is
+        // a byproduct write: no search, no sort. Multiple lanes of this token
+        // may hold valid slots; iterate the ballot as the SF store above does.
+        if constexpr (kEmitExpertIds and kDoExpand) {
+            if (recv_expert_ids != nullptr) {
+                auto mask = ptx::gather(dst_tensor_idx >= 0);
+                while (mask) {
+                    const int valid_lane_idx = __ffs(mask) - 1;
+                    const auto row = ptx::exchange(dst_tensor_idx, valid_lane_idx);
+                    const auto expert = ptx::exchange(dst_expert_idx, valid_lane_idx);
+                    if (lane_idx == 0)
+                        recv_expert_ids[row] = expert;
+                    mask ^= 1 << valid_lane_idx;
+                }
+            }
         }
         __syncwarp();
 
