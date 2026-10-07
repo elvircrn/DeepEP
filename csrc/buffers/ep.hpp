@@ -751,6 +751,7 @@ public:
                                           recv_src_metadata.data_ptr<int>(),
                                           channel_linked_list_ptr,
                                           num_unaligned_recv_tokens_per_expert_ptr,
+                                          recv_expert_ids_ptr,
                                           num_recv_tokens, num_max_tokens_per_rank,
                                           num_hidden_bytes,
                                           num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
