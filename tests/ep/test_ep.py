@@ -392,6 +392,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 cached_recv_topk_idx = cached_recv_topk_idx[:num_recv_tokens]
                 handle.recv_src_metadata = handle.recv_src_metadata[:num_recv_tokens]
                 expanded_handle.recv_src_metadata = expanded_handle.recv_src_metadata[:num_recv_tokens]
+                emit_handle.recv_src_metadata = emit_handle.recv_src_metadata[:num_recv_tokens]
 
             expanded_indices = expanded_handle.recv_src_metadata[:, 2:]
             expanded_mask = expanded_indices >= 0
@@ -459,12 +460,19 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
             row_hit = torch.zeros(emit_handle.recv_expert_ids.shape[0], dtype=torch.bool, device='cuda')
             row_hit[slot_rows] = True
             assert (emit_handle.recv_expert_ids[~row_hit] == -1).all()
-            # Data must be identical to plain expand mode on the valid slots
-            assert torch.equal(expanded_recv_x_bf16[valid_expanded_indices],
-                               emit_recv_x_bf16[valid_expanded_indices])
-            # Emission must not perturb the plain expanded results
-            assert torch.equal(expanded_recv_topk_weights[valid_expanded_indices],
-                               emit_recv_topk_weights[valid_expanded_indices])
+            # Data must match the reference: fold the emitted dispatch back to
+            # per-token rows (the same machinery the plain expanded check uses)
+            # and validate through the sorted-metadata comparison below. The two
+            # dispatches cannot be compared slot-by-slot: expand-mode
+            # within-expert placement is an atomic race, so independent
+            # dispatches assign different slots.
+            emit_slot_indices = emit_handle.recv_src_metadata[:num_recv_tokens, 2:]
+            emit_slot_mask = emit_slot_indices >= 0
+            emit_safe_indices = emit_slot_indices.clone()
+            emit_safe_indices[~emit_slot_mask] = 0
+            emit_folded_x = fold_expanded(emit_recv_x, emit_safe_indices, emit_slot_mask)
+            emit_folded_weights = emit_recv_topk_weights[emit_safe_indices]
+            assert emit_recv_topk_idx is None
 
             # Cached expand checks: compare valid token slots and verify padding is zeroed
             cached_expanded_recv_x_bf16 = get_recv_x_bf16(cached_expanded_recv_x)
@@ -523,6 +531,7 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
             # Check dispatch data
             for check_recv_x, check_recv_topk_idx, check_recv_topk_weights, check_handle in (
                 (expanded_recv_x, None, expanded_recv_topk_weights, expanded_handle),  # Expanded
+                (emit_folded_x, None, emit_folded_weights, emit_handle),  # Expanded with emitted expert IDs
                 (recv_x, recv_topk_idx, recv_topk_weights, handle),  # Unexpanded
             ):
                 for i in range(buffer.num_ranks):
